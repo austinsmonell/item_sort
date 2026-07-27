@@ -1,26 +1,38 @@
 <mujoco model="item_sort">
-  <!-- Overhead 2-axis sorting gantry over a walled platform.
+  <!-- Overhead 3-axis sorting gantry over a 4 ft square walled platform.
 
-       X axis: a low-profile bridge carriage that spans the platform in y and
-               slides along x.
-       Y axis: a smaller carriage that rides along the bridge in y.
+       X   axis: a bridge carriage that spans the platform in y and slides in x.
+       Y   axis: a smaller carriage that rides along the bridge in y.
+       Yaw axis: a hinge under that carriage that swings the pusher blade about
+                 z, so one blade can push along any heading instead of only
+                 along +/-x and +/-y.
 
-       Both axes are modeled as DIRECT LINEAR ACTUATORS -- a <motor> on a slide
-       joint producing force in Newtons. There is deliberately no motor, belt,
-       pulley or leadscrew geometry: on real hardware that drivetrain sits
-       between the controller and the axis, but from the controller's point of
-       view an axis is "commanded force -> linear motion", which is exactly what
-       these two joints are.
+       The linear axes are modeled as DIRECT LINEAR ACTUATORS and the rotary one
+       as a direct rotary actuator -- a <motor> on the joint, force in N or
+       torque in N*m. There is deliberately no motor, belt, pulley or leadscrew
+       geometry: on real hardware that drivetrain sits between the controller and
+       the axis, but from the controller's point of view an axis is "commanded
+       effort -> motion", which is exactly what these three joints are. What the
+       drivetrain *does* cost the controller is friction and reflected inertia,
+       and both are modeled: every joint has viscous `damping`, dry
+       `frictionloss` (config.AXIS_FRICTION, live-tunable from the GUI) and an
+       `armature`.
 
-       The only part of the gantry that touches anything is the paddle hanging
-       from the y carriage: it reaches down to just above the platform surface
-       so boxes are moved purely by shoving them with x/y motion. Every other
-       gantry geom has contype/conaffinity = 0 (class "gantry"), so the bridge
-       and rails pass over the boxes without colliding. -->
+       The only part of the gantry that touches anything is the blade hanging
+       from the yaw hinge: it reaches from just above the platform surface up
+       past the top of a box, so boxes are moved purely by shoving them. Every
+       other gantry geom has contype/conaffinity = 0 (class "gantry"), so the
+       bridge and rails pass over the boxes.
+
+       Several dimensions here are live model fields the GUI writes at runtime
+       rather than fixed geometry -- blade width, box masses, box/platform
+       friction, joint frictionloss. The values in this file are the startup
+       defaults from item_sort_config; see ItemSortSim for the setters. -->
   <compiler angle="radian"/>
-  <!-- timestep = 1/SIM_HZ (500 Hz). main also sets this in code so the PID
-       (250 Hz) lands on whole step counts. -->
-  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast"/>
+  <!-- timestep = 1/SIM_HZ (1000 Hz). main also sets this in code so the PID
+       (100 Hz) lands on whole step counts. It is this fine because the blade is
+       only 1/4 in thick: a coarser step lets it tunnel into a box face. -->
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="implicitfast"/>
 
   <default>
     <geom friction="0.5 0.005 0.0001" rgba="0.60 0.60 0.65 1"/>
@@ -29,6 +41,21 @@
     <!-- Non-colliding structure: rails, bridge beam, carriage body. -->
     <default class="gantry">
       <geom contype="0" conaffinity="0" rgba="0.30 0.33 0.40 1"/>
+    </default>
+    <!-- One class per box size, so the pool bodies below are one line each and
+         a size is changed in exactly one place. All three are 5 in tall
+         (half 0.0635) and differ only in footprint: 3 / 6 / 12 in square. -->
+    <default class="box">
+      <geom type="box" friction="0.5 0.005 0.0001"/>
+      <default class="small">
+        <geom size="0.0381 0.0381 0.0635" mass="0.20" rgba="0.80 0.28 0.25 1"/>
+      </default>
+      <default class="medium">
+        <geom size="0.0762 0.0762 0.0635" mass="0.70" rgba="0.25 0.38 0.80 1"/>
+      </default>
+      <default class="large">
+        <geom size="0.1524 0.1524 0.0635" mass="2.50" rgba="0.30 0.62 0.36 1"/>
+      </default>
     </default>
   </default>
 
@@ -43,87 +70,145 @@
 
     <!-- ===================== PLATFORM ===================== -->
     <!-- Work surface top is z = 0; all planar geometry in item_sort_config is
-         expressed in this frame. Half-extents 0.65 x 0.45 m, a little larger
-         than the axis travel so the paddle never reaches the lip. -->
-    <geom name="platform" type="box" pos="0 0 -0.025" size="0.65 0.45 0.025"
+         expressed in this frame. The usable square is 4 ft x 4 ft, i.e. half
+         extent 0.6096 m, bounded exactly by the inner faces of the lip below.
+         The slab is 20 mm oversize on each side so the lip has something to
+         stand on. -->
+    <geom name="platform" type="box" pos="0 0 -0.025" size="0.6296 0.6296 0.025"
           rgba="0.72 0.70 0.66 1"/>
 
     <!-- Perimeter lip so a stray box cannot leave the platform. Inner faces at
-         |x| = 0.63 and |y| = 0.43; the axis travel limits below keep the paddle
-         clear of them. -->
-    <geom name="wall_xp" type="box" pos=" 0.64 0     0.02" size="0.01 0.45 0.02"
+         |x| = |y| = 0.6096; the axis travel limits keep the blade clear of them
+         at any width and any yaw angle. 60 mm tall -- enough to stop a sliding
+         box without fouling the blade, whose underside is at z = 0.004. -->
+    <geom name="wall_xp" type="box" pos=" 0.6196 0      0.03" size="0.01 0.6296 0.03"
           rgba="0.55 0.53 0.50 1"/>
-    <geom name="wall_xn" type="box" pos="-0.64 0     0.02" size="0.01 0.45 0.02"
+    <geom name="wall_xn" type="box" pos="-0.6196 0      0.03" size="0.01 0.6296 0.03"
           rgba="0.55 0.53 0.50 1"/>
-    <geom name="wall_yp" type="box" pos=" 0    0.44  0.02" size="0.65 0.01 0.02"
+    <geom name="wall_yp" type="box" pos=" 0      0.6196 0.03" size="0.6296 0.01 0.03"
           rgba="0.55 0.53 0.50 1"/>
-    <geom name="wall_yn" type="box" pos=" 0   -0.44  0.02" size="0.65 0.01 0.02"
+    <geom name="wall_yn" type="box" pos=" 0     -0.6196 0.03" size="0.6296 0.01 0.03"
           rgba="0.55 0.53 0.50 1"/>
 
     <!-- ===================== GANTRY ===================== -->
     <!-- Static side rails the bridge would ride on (cosmetic). -->
-    <geom name="rail_yp" class="gantry" type="box" pos="0  0.49 0.075" size="0.67 0.015 0.015"/>
-    <geom name="rail_yn" class="gantry" type="box" pos="0 -0.49 0.075" size="0.67 0.015 0.015"/>
+    <geom name="rail_yp" class="gantry" type="box" pos="0  0.65 0.162" size="0.52 0.015 0.015"/>
+    <geom name="rail_yn" class="gantry" type="box" pos="0 -0.65 0.162" size="0.52 0.015 0.015"/>
 
     <!-- X axis: bridge carriage spanning the platform in y, sliding in x.
-         Travel limit 0.57 < wall inner face (0.63) - paddle half (0.045), so
-         the paddle never hits the lip. -->
-    <body name="bridge" pos="0 0 0.075">
-      <joint name="axis_x" type="slide" axis="1 0 0" range="-0.57 0.57"
-             damping="12" armature="1.0"/>
-      <geom class="gantry" type="box" size="0.030 0.47 0.015" mass="2.5"/>
+         Ride height 0.162 puts its underside at 0.147, clear of a 5 in box
+         (0.127 tall), so stock passes under the bridge.
+         Travel limit 0.45 < platform half (0.6096) - widest blade half (0.1524),
+         so the blade never reaches the lip. -->
+    <body name="bridge" pos="0 0 0.162">
+      <joint name="axis_x" type="slide" axis="1 0 0" range="-0.45 0.45"
+             damping="12" frictionloss="1.5" armature="1.0"/>
+      <geom class="gantry" type="box" size="0.030 0.52 0.015" mass="3.0"/>
 
-      <!-- Y axis: smaller carriage riding along the bridge.
-           Travel limit 0.375 < 0.43 - 0.045. -->
+      <!-- Y axis: smaller carriage riding along the bridge. Same travel as x;
+           the bridge is long enough (0.52 > 0.45 + carriage half) to carry it
+           the whole way. -->
       <body name="carriage" pos="0 0 0">
-        <joint name="axis_y" type="slide" axis="0 1 0" range="-0.375 0.375"
-               damping="6" armature="0.4"/>
-        <geom class="gantry" type="box" size="0.040 0.040 0.012" mass="0.6"
+        <joint name="axis_y" type="slide" axis="0 1 0" range="-0.45 0.45"
+               damping="6" frictionloss="0.8" armature="0.4"/>
+        <geom class="gantry" type="box" size="0.050 0.060 0.015" mass="0.8"
               rgba="0.45 0.48 0.55 1"/>
 
-        <!-- Pusher paddle: the gantry's ONLY colliding geom. Hangs from the
-             carriage down to z = 0.004 (4 mm above the surface) and reaches up
-             past the top of a box, so it shoves boxes low and they slide rather
-             than tip. Square, so it pushes equally well along +/-x and +/-y. -->
-        <geom name="paddle" type="box" pos="0 0 -0.040" size="0.045 0.045 0.031"
-              mass="0.3" rgba="0.85 0.65 0.20 1" friction="0.6 0.005 0.0001"/>
+        <!-- Yaw axis: swings the blade about z through the carriage centre.
+             +/-100 deg, so a square-on push along either axis in either
+             direction is inside the travel with the end-stop margin applied.
+             The blade's own inertia is small (a thin plate, ~0.002 kg*m^2), so
+             `armature` -- the drive's reflected inertia -- dominates it; that is
+             what keeps the yaw axis's tuning from moving much when the width
+             slider changes the blade. -->
+        <body name="paddle_yaw" pos="0 0 0">
+          <joint name="axis_yaw" type="hinge" axis="0 0 1"
+                 range="-1.7453292519943295 1.7453292519943295"
+                 damping="0.5" frictionloss="0.05" armature="0.05"/>
+
+          <!-- Pusher blade: the gantry's ONLY colliding geom. 1/4 in plate
+               standing on edge, hanging from the carriage underside (z = 0.147)
+               down to z = 0.004 (4 mm above the surface). Thickness is along
+               local x and width along local y, so at yaw = 0 it pushes in +/-x
+               and at yaw = 90 deg in +/-y. Full height, so it catches a box's
+               face low down and boxes slide rather than tip.
+
+               `size[1]` (the width half-extent) and `mass` are rewritten live by
+               ItemSortSim.set_paddle_width from the GUI slider; the values here
+               are config.PADDLE_WIDTH / paddle_mass() at startup. -->
+          <geom name="paddle" type="box" pos="0 0 -0.0865"
+                size="0.003175 0.1016 0.0715" mass="0.4999"
+                rgba="0.85 0.65 0.20 1" friction="0.6 0.005 0.0001"/>
+        </body>
       </body>
     </body>
 
-    <!-- ===================== BOXES ===================== -->
-    <!-- 40 mm cubes (half-extent 0.020) to shove around by hand. Their top at
-         z = 0.040 clears the bridge underside at z = 0.060, so only the paddle
-         ever touches them. Start poses here must match the "home" keyframe
-         below, and the body names must match item_sort_config.BOX_NAMES. -->
-    <body name="box1" pos="-0.35 0.20 0.020">
-      <freejoint name="box1_free"/>
-      <geom type="box" size="0.020 0.020 0.020" mass="0.20" rgba="0.80 0.25 0.25 1"/>
-    </body>
-    <body name="box2" pos="0.10 -0.25 0.020">
-      <freejoint name="box2_free"/>
-      <geom type="box" size="0.020 0.020 0.020" mass="0.20" rgba="0.25 0.35 0.80 1"/>
-    </body>
-    <body name="box3" pos="0.30 0.15 0.020">
-      <freejoint name="box3_free"/>
-      <geom type="box" size="0.020 0.020 0.020" mass="0.20" rgba="0.80 0.25 0.25 1"/>
-    </body>
+    <!-- ===================== BOX POOL ===================== -->
+    <!-- MuJoCo cannot add a body to a live model, so every box that could ever
+         be inserted is declared here up front and parked off-platform. The GUI
+         "inserts" one by teleporting a spare onto the surface (ItemSortSim
+         .spawn_box) and "clears" by sending them all back. Nothing sits on the
+         platform at startup.
+
+         Body names, order and count must match item_sort_config.BOX_NAMES /
+         BOX_SLOTS, and each body's `pos` is its staging pose from
+         config.box_park_pose -- ItemSortSim re-asserts those on reset, so the
+         two only need to agree for a clean first load.
+
+         Footprints and startup masses come from the size classes at the top of
+         the file; ItemSortSim.set_box_mass rewrites the masses live. -->
+    <body name="small1" pos="-2.70 2.20 0.0135"><freejoint/><geom name="small1_geom" class="small"/></body>
+    <body name="small2" pos="-2.25 2.20 0.0135"><freejoint/><geom name="small2_geom" class="small"/></body>
+    <body name="small3" pos="-1.80 2.20 0.0135"><freejoint/><geom name="small3_geom" class="small"/></body>
+    <body name="small4" pos="-1.35 2.20 0.0135"><freejoint/><geom name="small4_geom" class="small"/></body>
+    <body name="small5" pos="-0.90 2.20 0.0135"><freejoint/><geom name="small5_geom" class="small"/></body>
+    <body name="small6" pos="-0.45 2.20 0.0135"><freejoint/><geom name="small6_geom" class="small"/></body>
+
+    <body name="medium1" pos="0.00 2.20 0.0135"><freejoint/><geom name="medium1_geom" class="medium"/></body>
+    <body name="medium2" pos="0.45 2.20 0.0135"><freejoint/><geom name="medium2_geom" class="medium"/></body>
+    <body name="medium3" pos="0.90 2.20 0.0135"><freejoint/><geom name="medium3_geom" class="medium"/></body>
+    <body name="medium4" pos="1.35 2.20 0.0135"><freejoint/><geom name="medium4_geom" class="medium"/></body>
+
+    <body name="large1" pos="1.80 2.20 0.0135"><freejoint/><geom name="large1_geom" class="large"/></body>
+    <body name="large2" pos="2.25 2.20 0.0135"><freejoint/><geom name="large2_geom" class="large"/></body>
+    <body name="large3" pos="2.70 2.20 0.0135"><freejoint/><geom name="large3_geom" class="large"/></body>
   </worldbody>
 
+  <!-- Explicit platform <-> box contacts. Left to MuJoCo's default rule the
+       coefficient would be the *max* of the two geoms' friction, so the surface
+       could never be made more slippery than the boxes; a predefined pair takes
+       precedence and pins it exactly. ItemSortSim.set_surface_friction writes
+       the two sliding entries of these pairs, which is what makes
+       config.SURFACE_FRICTION a live GUI knob.
+
+       Box <-> box, box <-> lip and blade <-> box still use the geom rule. -->
+  <contact>
+    <pair geom1="platform" geom2="small1_geom"  friction="0.5 0.5 0.005 0.0001 0.0001"/>
+    <pair geom1="platform" geom2="small2_geom"  friction="0.5 0.5 0.005 0.0001 0.0001"/>
+    <pair geom1="platform" geom2="small3_geom"  friction="0.5 0.5 0.005 0.0001 0.0001"/>
+    <pair geom1="platform" geom2="small4_geom"  friction="0.5 0.5 0.005 0.0001 0.0001"/>
+    <pair geom1="platform" geom2="small5_geom"  friction="0.5 0.5 0.005 0.0001 0.0001"/>
+    <pair geom1="platform" geom2="small6_geom"  friction="0.5 0.5 0.005 0.0001 0.0001"/>
+    <pair geom1="platform" geom2="medium1_geom" friction="0.5 0.5 0.005 0.0001 0.0001"/>
+    <pair geom1="platform" geom2="medium2_geom" friction="0.5 0.5 0.005 0.0001 0.0001"/>
+    <pair geom1="platform" geom2="medium3_geom" friction="0.5 0.5 0.005 0.0001 0.0001"/>
+    <pair geom1="platform" geom2="medium4_geom" friction="0.5 0.5 0.005 0.0001 0.0001"/>
+    <pair geom1="platform" geom2="large1_geom"  friction="0.5 0.5 0.005 0.0001 0.0001"/>
+    <pair geom1="platform" geom2="large2_geom"  friction="0.5 0.5 0.005 0.0001 0.0001"/>
+    <pair geom1="platform" geom2="large3_geom"  friction="0.5 0.5 0.005 0.0001 0.0001"/>
+  </contact>
+
   <!-- Actuator order defines the axis vector used everywhere (AXIS_NAMES):
-       [x, y]. Force in Newtons; ctrlrange must match config.MAX_FORCE. -->
+       [x, y, yaw]. N on the slides, N*m on the hinge; ctrlrange must match
+       config.MAX_FORCE. -->
   <actuator>
-    <motor name="axis_x" joint="axis_x" ctrlrange="-80 80"/>
-    <motor name="axis_y" joint="axis_y" ctrlrange="-60 60"/>
+    <motor name="axis_x"   joint="axis_x"   ctrlrange="-120 120"/>
+    <motor name="axis_y"   joint="axis_y"   ctrlrange="-80 80"/>
+    <motor name="axis_yaw" joint="axis_yaw" ctrlrange="-20 20"/>
   </actuator>
 
-  <!-- Initial state: gantry centred, boxes at their start poses.
-       qpos = [axis_x, axis_y] then each box freejoint (x y z, quat w x y z),
-       in body-definition order. ItemSortSim resets to this keyframe. -->
-  <keyframe>
-    <key name="home"
-         qpos="0 0
-               -0.35  0.20 0.020  1 0 0 0
-                0.10 -0.25 0.020  1 0 0 0
-                0.30  0.15 0.020  1 0 0 0"/>
-  </keyframe>
+  <!-- No <keyframe>: the nominal initial state is "gantry centred, blade square
+       on, box pool parked", which is what the bodies above already declare, and
+       ItemSortSim.reset_state parks every box explicitly anyway. A keyframe
+       would mean maintaining all 13 box poses in a second place. -->
 </mujoco>
