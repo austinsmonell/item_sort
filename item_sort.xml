@@ -1,0 +1,129 @@
+<mujoco model="item_sort">
+  <!-- Overhead 2-axis sorting gantry over a walled platform.
+
+       X axis: a low-profile bridge carriage that spans the platform in y and
+               slides along x.
+       Y axis: a smaller carriage that rides along the bridge in y.
+
+       Both axes are modeled as DIRECT LINEAR ACTUATORS -- a <motor> on a slide
+       joint producing force in Newtons. There is deliberately no motor, belt,
+       pulley or leadscrew geometry: on real hardware that drivetrain sits
+       between the controller and the axis, but from the controller's point of
+       view an axis is "commanded force -> linear motion", which is exactly what
+       these two joints are.
+
+       The only part of the gantry that touches anything is the paddle hanging
+       from the y carriage: it reaches down to just above the platform surface
+       so boxes are moved purely by shoving them with x/y motion. Every other
+       gantry geom has contype/conaffinity = 0 (class "gantry"), so the bridge
+       and rails pass over the boxes without colliding. -->
+  <compiler angle="radian"/>
+  <!-- timestep = 1/SIM_HZ (500 Hz). main also sets this in code so the PID
+       (250 Hz) lands on whole step counts. -->
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast"/>
+
+  <default>
+    <geom friction="0.5 0.005 0.0001" rgba="0.60 0.60 0.65 1"/>
+    <joint limited="true"/>
+    <motor gear="1"/>
+    <!-- Non-colliding structure: rails, bridge beam, carriage body. -->
+    <default class="gantry">
+      <geom contype="0" conaffinity="0" rgba="0.30 0.33 0.40 1"/>
+    </default>
+  </default>
+
+  <visual>
+    <headlight diffuse="0.5 0.5 0.5" ambient="0.3 0.3 0.3"/>
+  </visual>
+
+  <worldbody>
+    <light pos="0 0 2.5" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    <geom name="ground" type="plane" pos="0 0 -0.05" size="0 0 0.1"
+          rgba="0.82 0.82 0.84 1"/>
+
+    <!-- ===================== PLATFORM ===================== -->
+    <!-- Work surface top is z = 0; all planar geometry in item_sort_config is
+         expressed in this frame. Half-extents 0.65 x 0.45 m, a little larger
+         than the axis travel so the paddle never reaches the lip. -->
+    <geom name="platform" type="box" pos="0 0 -0.025" size="0.65 0.45 0.025"
+          rgba="0.72 0.70 0.66 1"/>
+
+    <!-- Perimeter lip so a stray box cannot leave the platform. Inner faces at
+         |x| = 0.63 and |y| = 0.43; the axis travel limits below keep the paddle
+         clear of them. -->
+    <geom name="wall_xp" type="box" pos=" 0.64 0     0.02" size="0.01 0.45 0.02"
+          rgba="0.55 0.53 0.50 1"/>
+    <geom name="wall_xn" type="box" pos="-0.64 0     0.02" size="0.01 0.45 0.02"
+          rgba="0.55 0.53 0.50 1"/>
+    <geom name="wall_yp" type="box" pos=" 0    0.44  0.02" size="0.65 0.01 0.02"
+          rgba="0.55 0.53 0.50 1"/>
+    <geom name="wall_yn" type="box" pos=" 0   -0.44  0.02" size="0.65 0.01 0.02"
+          rgba="0.55 0.53 0.50 1"/>
+
+    <!-- ===================== GANTRY ===================== -->
+    <!-- Static side rails the bridge would ride on (cosmetic). -->
+    <geom name="rail_yp" class="gantry" type="box" pos="0  0.49 0.075" size="0.67 0.015 0.015"/>
+    <geom name="rail_yn" class="gantry" type="box" pos="0 -0.49 0.075" size="0.67 0.015 0.015"/>
+
+    <!-- X axis: bridge carriage spanning the platform in y, sliding in x.
+         Travel limit 0.57 < wall inner face (0.63) - paddle half (0.045), so
+         the paddle never hits the lip. -->
+    <body name="bridge" pos="0 0 0.075">
+      <joint name="axis_x" type="slide" axis="1 0 0" range="-0.57 0.57"
+             damping="12" armature="1.0"/>
+      <geom class="gantry" type="box" size="0.030 0.47 0.015" mass="2.5"/>
+
+      <!-- Y axis: smaller carriage riding along the bridge.
+           Travel limit 0.375 < 0.43 - 0.045. -->
+      <body name="carriage" pos="0 0 0">
+        <joint name="axis_y" type="slide" axis="0 1 0" range="-0.375 0.375"
+               damping="6" armature="0.4"/>
+        <geom class="gantry" type="box" size="0.040 0.040 0.012" mass="0.6"
+              rgba="0.45 0.48 0.55 1"/>
+
+        <!-- Pusher paddle: the gantry's ONLY colliding geom. Hangs from the
+             carriage down to z = 0.004 (4 mm above the surface) and reaches up
+             past the top of a box, so it shoves boxes low and they slide rather
+             than tip. Square, so it pushes equally well along +/-x and +/-y. -->
+        <geom name="paddle" type="box" pos="0 0 -0.040" size="0.045 0.045 0.031"
+              mass="0.3" rgba="0.85 0.65 0.20 1" friction="0.6 0.005 0.0001"/>
+      </body>
+    </body>
+
+    <!-- ===================== BOXES ===================== -->
+    <!-- 40 mm cubes (half-extent 0.020) to shove around by hand. Their top at
+         z = 0.040 clears the bridge underside at z = 0.060, so only the paddle
+         ever touches them. Start poses here must match the "home" keyframe
+         below, and the body names must match item_sort_config.BOX_NAMES. -->
+    <body name="box1" pos="-0.35 0.20 0.020">
+      <freejoint name="box1_free"/>
+      <geom type="box" size="0.020 0.020 0.020" mass="0.20" rgba="0.80 0.25 0.25 1"/>
+    </body>
+    <body name="box2" pos="0.10 -0.25 0.020">
+      <freejoint name="box2_free"/>
+      <geom type="box" size="0.020 0.020 0.020" mass="0.20" rgba="0.25 0.35 0.80 1"/>
+    </body>
+    <body name="box3" pos="0.30 0.15 0.020">
+      <freejoint name="box3_free"/>
+      <geom type="box" size="0.020 0.020 0.020" mass="0.20" rgba="0.80 0.25 0.25 1"/>
+    </body>
+  </worldbody>
+
+  <!-- Actuator order defines the axis vector used everywhere (AXIS_NAMES):
+       [x, y]. Force in Newtons; ctrlrange must match config.MAX_FORCE. -->
+  <actuator>
+    <motor name="axis_x" joint="axis_x" ctrlrange="-80 80"/>
+    <motor name="axis_y" joint="axis_y" ctrlrange="-60 60"/>
+  </actuator>
+
+  <!-- Initial state: gantry centred, boxes at their start poses.
+       qpos = [axis_x, axis_y] then each box freejoint (x y z, quat w x y z),
+       in body-definition order. ItemSortSim resets to this keyframe. -->
+  <keyframe>
+    <key name="home"
+         qpos="0 0
+               -0.35  0.20 0.020  1 0 0 0
+                0.10 -0.25 0.020  1 0 0 0
+                0.30  0.15 0.020  1 0 0 0"/>
+  </keyframe>
+</mujoco>
