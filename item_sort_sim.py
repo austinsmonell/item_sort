@@ -2,8 +2,18 @@ import numpy as np
 import mujoco
 
 from item_sort_config import (
-    TRAVEL, PLATFORM_HALF, BOX_SPAWN_MARGIN, box_park_pose, paddle_mass,
+    TRAVEL, PLATFORM_HALF, BOX_SPAWN_MARGIN, box_park_pose, bracket_arm_mass,
+    BRACKET_THICKNESS, BRACKET_A_CORNER, BRACKET_B_CORNER, JAW, jaw_opening,
 )
+
+# The two brackets, in the order ItemSortSim holds them: for each, its geom name
+# prefix, the fixed position of its corner in the carriage frame, and which way
+# its arms run from that corner. A is the fixed bracket with its arms running
+# +x/+y; B is the moving jaw, mirrored, with its arms running back toward A. The
+# sign is all that differs between them, which is what lets one loop reshape
+# both -- see set_bracket_width.
+_BRACKETS = (("bracket_a", BRACKET_A_CORNER, +1.0),
+             ("bracket_b", BRACKET_B_CORNER, -1.0))
 
 
 def _box_inertia(half_extents, mass):
@@ -16,23 +26,45 @@ def _box_inertia(half_extents, mass):
                                          a * a + b * b])
 
 
+def _composite_inertial(parts):
+    """Mass, centre of mass and diagonal inertia about that centre for a rigid
+    assembly of solid cuboids -- each part a (half_extents, centre, mass) triple
+    in a shared frame. Used for the right-angle blade, which is two of them.
+
+    Products of inertia are dropped, so this is only the diagonal an L-shape
+    would have if its principal axes were the frame's. That is exact for a
+    single centred box and an approximation for the angle -- and it costs
+    nothing, because the blade is welded to a carriage that can only translate,
+    so no rotational term of any kind enters the reduced dynamics. MuJoCo still
+    wants the field populated and sane, which is what this gives it.
+    """
+    mass = sum(float(m) for _, _, m in parts)
+    com = sum(float(m) * np.asarray(c, dtype=float) for _, c, m in parts) / mass
+    inertia = np.zeros(3)
+    for half, centre, m in parts:
+        d2 = (np.asarray(centre, dtype=float) - com) ** 2
+        inertia += _box_inertia(half, m) + float(m) * np.array(
+            [d2[1] + d2[2], d2[0] + d2[2], d2[0] + d2[1]])
+    return mass, com, inertia
+
+
 class ItemSortSim:
-    """MuJoCo stand-in for the sorting gantry: its three axes, the blade on the
-    end of them, and the pool of boxes that can be put on the platform.
+    """MuJoCo stand-in for the sorting gantry: its three axes, the two L brackets
+    on the end of them, and the pool of boxes that can be put on the platform.
 
     Positions, velocities and commands are 3-vectors in AXIS_NAMES order
-    ([x, y, yaw]) and carry that axis's units -- m / m/s / N on the two slides,
-    rad / rad/s / N*m on the hinge. As in MuJoCo itself, "force" names the
-    command on every axis regardless of joint type. There is no
-    radian<->revolution conversion anywhere: unlike the balance_bot / biped
-    wrappers this project stays in plain SI.
+    ([x, y, jaw]) in m, m/s and N -- the jaw is a slide like the other two, its
+    coordinate being the moving bracket's stroke along the diagonal. There is no
+    revolution or torque conversion anywhere: unlike the balance_bot / biped
+    wrappers this project stays in plain linear SI, and the motor-side torque and
+    rpm the GUI shows are derived above this class, in item_sort_config.
 
     Boxes work by pool, not by creation: MuJoCo models are fixed once compiled,
     so the XML declares every box that could ever appear and parks the unused
     ones off-platform. spawn_box brings one in, park_box / park_all_boxes send
     them back, and a "slot" throughout is an index into `box_names`.
 
-    Everything the GUI can dial at runtime -- blade width, box masses, the
+    Everything the GUI can dial at runtime -- bracket width, box masses, the
     box/platform friction, the axes' dry friction -- is a *model* field rather
     than a constant, so the setters below write mjModel in place. Each one
     ignores a write that would not change anything, since some of them (mass or
@@ -75,13 +107,31 @@ class ItemSortSim:
                 f"axis travel in {model_path} {self.travel_limits.tolist()} does "
                 f"not match item_sort_config.TRAVEL {TRAVEL.tolist()}")
 
-        # The blade: the gantry's only colliding geom, and the one piece of
-        # geometry the GUI reshapes at runtime.
-        self.paddle_geom_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_GEOM, "paddle")
-        if self.paddle_geom_id < 0:
-            raise ValueError(f"geom 'paddle' not found in {model_path}")
-        self.paddle_body_id = int(self.model.geom_bodyid[self.paddle_geom_id])
+        # The tool: two L brackets, the gantry's only colliding geoms and the one
+        # piece of geometry the GUI reshapes at runtime. Each bracket's two
+        # plates are indexed in AXIS_NAMES order -- plate [X] is the one NORMAL
+        # to x, i.e. the one that pushes along x. That a plate's index equals its
+        # normal's axis index is what makes set_bracket_width a loop rather than
+        # four hand-written cases.
+        self.bracket_geom_ids = []   # (n_brackets, 2), plates per bracket
+        self.bracket_body_ids = []
+        for prefix, _corner, _arm in _BRACKETS:
+            gids = []
+            for suffix in ("x", "y"):
+                gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM,
+                                        f"{prefix}_{suffix}")
+                if gid < 0:
+                    raise ValueError(
+                        f"geom '{prefix}_{suffix}' not found in {model_path}")
+                gids.append(gid)
+            bid = int(self.model.geom_bodyid[gids[0]])
+            if int(self.model.geom_bodyid[gids[1]]) != bid:
+                raise ValueError(f"the '{prefix}' plates in {model_path} are on "
+                                 "different bodies; a bracket is one rigid part")
+            self.bracket_geom_ids.append(gids)
+            self.bracket_body_ids.append(bid)
+        # Flat list, for the places that just want "every geom of the tool".
+        self.tool_geom_ids = np.array(self.bracket_geom_ids, dtype=int).ravel()
 
         # Box bodies -- the pool of items to shove around. Optional: an empty
         # list gives a bare gantry, useful for tuning the axis PID on its own.
@@ -145,8 +195,8 @@ class ItemSortSim:
         return self.model.opt.timestep
 
     def reset_state(self, pos=None, vel=None):
-        """Reset to the nominal initial state: axes centred, blade square on, and
-        every box back in the staging row, i.e. a clear platform. `pos`/`vel` are
+        """Reset to the nominal initial state: axes centred and every box back in
+        the staging row, i.e. a clear platform. `pos`/`vel` are
         optional axis overrides in AXIS_NAMES order applied on top."""
         if self._home_key is not None:
             mujoco.mj_resetDataKeyframe(self.model, self.data, self._home_key)
@@ -160,8 +210,7 @@ class ItemSortSim:
         self.park_all_boxes()   # also does the mj_forward
 
     def set_force(self, force):
-        """Command axis efforts, [x, y, yaw] -- N on the slides, N*m on the
-        hinge. Held until the next call."""
+        """Command axis forces, [x, y] in N. Held until the next call."""
         self._force = np.asarray(force, dtype=float)
 
     def step_n(self, n):
@@ -171,11 +220,11 @@ class ItemSortSim:
             mujoco.mj_step(self.model, self.data)
 
     def get_pos(self):
-        """Axis positions [x, y, yaw] -- m, m, rad."""
+        """Axis positions [x, y] -- m."""
         return self.data.qpos[self.qpos_addrs].copy()
 
     def get_vel(self):
-        """Axis velocities [x, y, yaw] -- m/s, m/s, rad/s."""
+        """Axis velocities [x, y] -- m/s."""
         return self.data.qvel[self.qvel_addrs].copy()
 
     def stop(self):
@@ -202,10 +251,9 @@ class ItemSortSim:
             self.model.geom_friction[self.box_geom_ids, 0] = mu
 
     def set_axis_friction(self, values):
-        """Dry (Coulomb) friction per axis, [x, y, yaw] in N, N, N*m -- MuJoCo
-        frictionloss.
+        """Dry (Coulomb) friction per axis, [x, y] in N -- MuJoCo frictionloss.
 
-        The effort each axis must overcome before it moves at all, regardless of
+        The force each axis must overcome before it moves at all, regardless of
         speed. Viscous drag is the joints' `damping` and is not tunable here.
         """
         values = np.asarray(values, dtype=float)
@@ -235,35 +283,59 @@ class ItemSortSim:
         # (subtree masses, the reference mass matrix diagonal).
         mujoco.mj_setConst(self.model, self.data)
 
-    def set_paddle_width(self, width):
-        """Blade width (m): its extent along the local y of the yaw axis.
+    def set_bracket_width(self, width):
+        """Arm span (m) of the L brackets -- one slider, all four plates.
 
-        Reshapes the geom rather than swapping models, so besides the size this
-        has to maintain everything the compiler derived from it: the collision
-        bounding volumes (stale ones would let the broad-phase miss contacts as
-        the blade grows) and the blade's mass and inertia, which scale with width
-        because a wider blade is more of the same stock.
+        Reshapes the geoms rather than swapping models, so besides the size this
+        has to maintain everything the compiler derived from them: each plate's
+        position (a bracket's corner is fixed, so growing an arm moves that
+        plate's centre out along the arm), the collision bounding volumes (stale
+        ones would let the broad-phase miss contacts as the brackets grow), and
+        each bracket's mass, centre and inertia, which follow the width because a
+        longer arm is more of the same stock.
+
+        The jaw axis is untouched by this: the brackets' corners do not move, so
+        the pocket between them is exactly as wide as it was. What changes is how
+        much of a box's face each arm covers.
         """
         width = float(width)
-        if self._applied.get("paddle_width") == width:
+        if self._applied.get("bracket_width") == width:
             return
-        self._applied["paddle_width"] = width
+        self._applied["bracket_width"] = width
 
-        gid, bid = self.paddle_geom_id, self.paddle_body_id
-        self.model.geom_size[gid, 1] = width / 2.0
-        size = self.model.geom_size[gid]
-        self.model.geom_rbound[gid] = float(np.linalg.norm(size))
-        self.model.geom_aabb[gid, 0:3] = 0.0      # box is centred in its frame
-        self.model.geom_aabb[gid, 3:6] = size
+        half = width / 2.0
+        thick = BRACKET_THICKNESS / 2.0
+        arm_mass = bracket_arm_mass(width)
+        for (_prefix, corner, arm), gids, bid in zip(
+                _BRACKETS, self.bracket_geom_ids, self.bracket_body_ids):
+            parts = []
+            # A plate's index is the axis it is normal to, so `axis` picks its
+            # thickness direction and `1 - axis` the long one. `arm` flips the
+            # whole bracket: +1 runs the arms away from the corner in +x/+y,
+            # -1 mirrors it so they run back the other way.
+            for axis, gid in enumerate(gids):
+                size = self.model.geom_size[gid].copy()
+                pos = self.model.geom_pos[gid].copy()
+                size[axis] = thick          # across the plate
+                size[1 - axis] = half       # along the arm
+                pos[axis] = corner - arm * thick    # just outside the corner
+                pos[1 - axis] = corner + arm * half  # centred along the arm
+                self.model.geom_size[gid] = size
+                self.model.geom_pos[gid] = pos
+                self.model.geom_rbound[gid] = float(np.linalg.norm(size))
+                self.model.geom_aabb[gid, 0:3] = 0.0   # box centred in its frame
+                self.model.geom_aabb[gid, 3:6] = size
+                parts.append((size, pos, arm_mass))
 
-        mass = paddle_mass(width)
-        self.model.body_mass[bid] = mass
-        self.model.body_inertia[bid] = _box_inertia(size, mass)
+            mass, com, inertia = _composite_inertial(parts)
+            self.model.body_mass[bid] = mass
+            self.model.body_ipos[bid] = com
+            self.model.body_inertia[bid] = inertia
         mujoco.mj_setConst(self.model, self.data)
 
-    def get_paddle_width(self):
-        """Current blade width, m."""
-        return 2.0 * float(self.model.geom_size[self.paddle_geom_id, 1])
+    def get_bracket_width(self):
+        """Current bracket arm span, m."""
+        return 2.0 * float(self.model.geom_size[self.bracket_geom_ids[0][0], 1])
 
     # ---- box pool ----------------------------------------------------------
 
@@ -321,16 +393,23 @@ class ItemSortSim:
         Scores a grid of candidate centres by their clearance -- the smallest gap
         to any wall, to the blade, or to a box already down -- and takes the
         roomiest. Boxes are axis-aligned squares, so gaps are Chebyshev distances
-        between centres less the two half-extents. The blade is not axis-aligned
-        once yaw is off zero, so it stands in as a square of its longer side:
-        crude, but it only ever refuses a spot that was marginal anyway.
+        between centres less the two half-extents. The tool is two L brackets
+        rather than a square, so it stands in as the square that bounds both of
+        them: crude, but it only ever refuses a spot that was marginal anyway.
+
+        Bracket B's plates move with the jaw axis, so this reads their live world
+        poses rather than the model's rest positions.
         """
         reach = PLATFORM_HALF - half - BOX_SPAWN_MARGIN
         if np.any(reach <= 0):
             return None     # box is wider than the platform
 
-        blade_half = float(np.max(self.model.geom_size[self.paddle_geom_id, 0:2]))
-        obstacles = [(self.get_paddle_pos(), blade_half)]
+        centre = self.get_tool_pos()
+        tool_half = max(
+            float(np.max(np.abs(self.data.geom_xpos[gid][:2] - centre)
+                         + self.model.geom_size[gid][:2]))
+            for gid in self.tool_geom_ids)
+        obstacles = [(centre, tool_half)]
         for slot in self.active_slots():
             obstacles.append((self.data.xpos[self.box_body_ids[slot], :2],
                               self.box_halfs[slot]))
@@ -364,7 +443,15 @@ class ItemSortSim:
             return np.zeros(0)
         return self.data.xpos[self.box_body_ids, 2].copy()
 
-    def get_paddle_pos(self):
-        """Blade centre (x, y), m -- the axes' intersection, which is also the
-        yaw axis, so this is independent of the blade's angle."""
+    def get_tool_pos(self):
+        """Carriage centre (x, y), m -- the x/y axes' intersection, and the point
+        both brackets hang from. It is NOT the centre of the jaw's pocket, which
+        sits off it by half the current opening in +x and +y (bracket A is the
+        fixed one); see get_jaw_opening."""
         return self.data.qpos[self.qpos_addrs[:2]].copy()
+
+    def get_jaw_opening(self):
+        """Side of the square pocket between the brackets, m. The number that
+        says whether a box fits, and how hard the jaw is squeezing one that
+        does."""
+        return float(jaw_opening(self.data.qpos[self.qpos_addrs[JAW]]))

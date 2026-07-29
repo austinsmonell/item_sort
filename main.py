@@ -2,11 +2,12 @@
 
 Two windows come up. The MuJoCo viewer shows the machine; the control panel has
 
-  * an X / Y / Yaw slider set -- the PID setpoint, in m, m and rad
+  * an X / Y / Jaw slider set -- the PID setpoint, in m (the jaw's being the
+    moving bracket's stroke along the diagonal, not the pocket it opens)
   * per-axis Kp/Kd/Ki, motor torque, gearing and dry-friction sliders, so the
     loop and the drivetrain it is fighting can both be trimmed while it runs,
     plus a motor-side readout (torque, rpm, and a resettable peak torque)
-  * a blade width slider
+  * a bracket width slider
   * buttons that drop 3 / 6 / 12 in boxes onto the platform (it starts empty), a
     mass slider per box size, and the box-on-platform friction coefficient
 
@@ -29,9 +30,10 @@ from item_sort_config import (
     SOFT_TRAVEL, KP, KD, KI, KP_MAX, KD_MAX, KI_MAX, INTEGRAL_LIMIT,
     MAX_FORCE, FORCE_LIMIT, AXIS_FRICTION, AXIS_FRICTION_MAX,
     MOTOR_TORQUE, MOTOR_TORQUE_MAX, MOTOR_UNITS, RPM_UNITS,
-    GEAR, GEAR_MIN, GEAR_MAX, GEAR_LABELS, GEAR_UNITS, GEAR_SCALE,
+    GEAR, GEAR_MIN, GEAR_MAX, GEAR_LABEL, GEAR_UNIT, GEAR_SCALE,
     gear_gain, axis_effort_limit, motor_torque, motor_rpm,
-    PADDLE_WIDTH, PADDLE_WIDTH_MIN, PADDLE_WIDTH_MAX,
+    INCH, BRACKET_WIDTH, BRACKET_WIDTH_MIN, BRACKET_WIDTH_MAX,
+    JAW, JAW_OPENING_MIN, JAW_OPENING_MAX, jaw_opening,
     BOX_KINDS, BOX_SIDE_IN, BOX_SLOTS, BOX_KIND_SLOTS,
     BOX_MASS, BOX_MASS_MIN, BOX_MASS_MAX,
     SURFACE_FRICTION, SURFACE_FRICTION_MIN, SURFACE_FRICTION_MAX,
@@ -60,10 +62,10 @@ def _axis_row(name, values, units, width=7, precision=3):
 
 class ControlPanel:
     """Tk window holding the setpoint sliders, the live gain tuners, and -- when
-    given a sim to talk to -- the blade width, box pool and friction knobs.
+    given a sim to talk to -- the bracket width, box pool and friction knobs.
 
     `robot` is optional: without it the panel is just the axis controls, which is
-    what a hardware run would want (no boxes to insert, and the blade and the
+    what a hardware run would want (no boxes to insert, and the brackets and the
     friction are whatever the real machine has).
     """
 
@@ -80,8 +82,8 @@ class ControlPanel:
         self.peak_torque = np.zeros(N_AXES)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # --- setpoint, one slider per axis (m, m, rad) ---
-        target = tk.LabelFrame(self.root, text="Blade target", padx=6, pady=4)
+        # --- setpoint, one slider per axis (all m) ---
+        target = tk.LabelFrame(self.root, text="Axis targets", padx=6, pady=4)
         target.pack(fill="x", padx=8, pady=(8, 4))
         self.target_vars = []
         for axis, label in enumerate(AXIS_LABELS):
@@ -105,23 +107,21 @@ class ControlPanel:
             frame.pack(side="left", fill="both", expand=True, padx=2)
             # The PID's output limit is not a slider: it is what the motor and
             # its gearing can deliver, so the knobs are the motor's stall torque
-            # and the pitch radius (ratio, on yaw) it drives through -- size the
-            # drivetrain and the force limit follows. "friction" is the axis's
-            # dry friction, i.e. what that drivetrain costs before the axis moves
-            # at all -- the knob that makes a well-tuned PID stick short of its
-            # setpoint.
+            # and the pitch radius it drives through -- size the drivetrain and
+            # the force limit follows. "friction" is the axis's dry friction,
+            # i.e. what that drivetrain costs before the axis moves at all -- the
+            # knob that makes a well-tuned PID stick short of its setpoint.
             for key, text, value, lo, hi in (
                     ("Kp", "Kp", KP[axis], 0.0, KP_MAX[axis]),
                     ("Kd", "Kd", KD[axis], 0.0, KD_MAX[axis]),
                     ("Ki", "Ki", KI[axis], 0.0, KI_MAX[axis]),
                     ("Tmax", f"max torque ({MOTOR_UNITS[axis]})",
                      MOTOR_TORQUE[axis], 0.0, MOTOR_TORQUE_MAX[axis]),
-                    # Gear sliders read in display units (mm of radius, or a bare
-                    # ratio); apply_to scales them back to SI.
-                    ("Gear", f"{GEAR_LABELS[axis]} ({GEAR_UNITS[axis]})",
-                     GEAR[axis] * GEAR_SCALE[axis],
-                     GEAR_MIN[axis] * GEAR_SCALE[axis],
-                     GEAR_MAX[axis] * GEAR_SCALE[axis]),
+                    # Gear sliders read in mm; apply_to scales them back to SI.
+                    ("Gear", f"{GEAR_LABEL} ({GEAR_UNIT})",
+                     GEAR[axis] * GEAR_SCALE,
+                     GEAR_MIN[axis] * GEAR_SCALE,
+                     GEAR_MAX[axis] * GEAR_SCALE),
                     ("Fric", f"friction ({unit})",
                      AXIS_FRICTION[axis], 0.0, AXIS_FRICTION_MAX[axis])):
                 var = tk.DoubleVar(value=float(value))
@@ -131,20 +131,23 @@ class ControlPanel:
                          label=text).pack(fill="x")
                 self.gain_vars[(axis, key)] = var
 
-        # --- blade, box pool and surface friction (sim only) ---
+        # --- brackets, box pool and surface friction (sim only) ---
         self.width_var = None
         self.surface_var = None
         self.mass_vars = {}
         self.box_status = None
         self._box_note = ""
         if robot is not None:
-            blade = tk.LabelFrame(self.root, text="Blade", padx=6, pady=4)
-            blade.pack(fill="x", padx=8, pady=4)
-            self.width_var = tk.DoubleVar(value=float(PADDLE_WIDTH))
-            tk.Scale(blade, from_=PADDLE_WIDTH_MIN, to=PADDLE_WIDTH_MAX,
+            tool = tk.LabelFrame(self.root, text="Brackets", padx=6, pady=4)
+            tool.pack(fill="x", padx=8, pady=4)
+            self.width_var = tk.DoubleVar(value=float(BRACKET_WIDTH))
+            # One slider for all four plates. It does not move the corners, so
+            # the jaw's opening is unaffected -- what changes is how much of a
+            # box's face each arm covers, and how much mass every axis carries.
+            tk.Scale(tool, from_=BRACKET_WIDTH_MIN, to=BRACKET_WIDTH_MAX,
                      resolution=0.001, orient="horizontal", length=420,
                      variable=self.width_var,
-                     label="width (m)   — mass and yaw inertia follow it"
+                     label="arm span (m)   — all four plates; mass follows it"
                      ).pack(fill="x")
 
             boxes = tk.LabelFrame(self.root, text="Boxes", padx=6, pady=4)
@@ -196,21 +199,19 @@ class ControlPanel:
         self.readout.pack(fill="x", padx=10, pady=(0, 8))
 
     def centre(self):
-        """Park the blade at the middle of the platform, square on."""
+        """Park the tool at the middle of the platform with the jaw at
+        mid-stroke -- every axis to zero, which is this machine's home."""
         for var in self.target_vars:
             var.set(0.0)
 
     # --- drivetrain ---
 
     def drivetrain(self):
-        """The motor sliders as SI vectors: (max shaft torque N*m, gear).
-
-        The gear entry is a pitch radius in m on the linear axes and a bare
-        ratio on yaw -- GEAR_SCALE undoes the units the sliders display in.
-        """
+        """The motor sliders as SI vectors: (max shaft torque N*m, pinion pitch
+        radius m). GEAR_SCALE undoes the mm the gear sliders display in."""
         torque = np.array([self.gain_vars[(a, "Tmax")].get()
                            for a in range(N_AXES)])
-        gear = np.array([self.gain_vars[(a, "Gear")].get() / GEAR_SCALE[a]
+        gear = np.array([self.gain_vars[(a, "Gear")].get() / GEAR_SCALE
                          for a in range(N_AXES)])
         return torque, gear
 
@@ -281,7 +282,7 @@ class ControlPanel:
             return
         self.robot.set_axis_friction([self.gain_vars[(a, "Fric")].get()
                                       for a in range(N_AXES)])
-        self.robot.set_paddle_width(self.width_var.get())
+        self.robot.set_bracket_width(self.width_var.get())
         self.robot.set_surface_friction(self.surface_var.get())
         for kind, var in self.mass_vars.items():
             self.robot.set_box_mass(BOX_KIND_SLOTS[kind], var.get())
@@ -301,6 +302,12 @@ class ControlPanel:
         # drivetrain has outgrown the actuator.
         torque_max, gear = self.drivetrain()
         gain = gear_gain(gear)
+
+        # The jaw's own coordinate is the actuator's diagonal stroke, which is
+        # not the number you want when deciding whether a box fits -- that is the
+        # pocket the two brackets enclose. Inches too, since the boxes are
+        # specified in them.
+        opening = float(jaw_opening(pos[JAW]))
         self.readout.config(text=(
             _axis_row("pos", pos, AXIS_UNITS) + "\n"
             + _axis_row("err", err, AXIS_UNITS) + "\n"
@@ -311,7 +318,9 @@ class ControlPanel:
             + _axis_row("peak", self.peak_torque, MOTOR_UNITS, precision=3) + "\n"
             + _axis_row("lim", np.minimum(torque_max, MAX_FORCE / gain),
                         MOTOR_UNITS, precision=3) + "\n"
-            + _axis_row("rpm", motor_rpm(vel, gear), RPM_UNITS, precision=0)))
+            + _axis_row("rpm", motor_rpm(vel, gear), RPM_UNITS, precision=0) + "\n"
+            + f"jaw  pocket {opening:+7.3f} m  ({opening / INCH:.1f}\")"
+              f"   shut {JAW_OPENING_MIN:.3f}  wide {JAW_OPENING_MAX:.3f}"))
         if self.box_status is not None:
             counts = "   ".join(
                 f'{BOX_SIDE_IN[k]:g}" '
@@ -395,11 +404,13 @@ def run_on_hardware():
     """Placeholder — no sorting-gantry hardware yet.
 
     When a physical machine exists, mirror balance_bot/pendulum: open the axis
-    drive backend, home all three axes against their end stops to establish the
-    zero that item_sort_config.TRAVEL is measured from, then run
-    pid.compute(pos, vel) at CTRL_HZ, writing the resulting force (or torque, on
-    yaw, or their current-loop equivalents) to each axis. Ensure a safe stop --
-    zero effort, brakes engaged -- on exit.
+    drive backend, home both axes against their end stops to establish the zero
+    that item_sort_config.TRAVEL is measured from, then run pid.compute(pos, vel)
+    at CTRL_HZ, writing the resulting force to each axis. That last step is where
+    the drivetrain in item_sort_config stops being a readout and starts being
+    real: a drive takes shaft torque (or current), so divide by the gear radius
+    on the way out, and check the motor against the peak torque and rpm the sim
+    reports. Ensure a safe stop -- zero effort, brakes engaged -- on exit.
     """
     raise NotImplementedError("item_sort hardware is not implemented yet")
 

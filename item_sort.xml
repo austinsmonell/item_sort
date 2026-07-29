@@ -3,29 +3,35 @@
 
        X   axis: a bridge carriage that spans the platform in y and slides in x.
        Y   axis: a smaller carriage that rides along the bridge in y.
-       Yaw axis: a hinge under that carriage that swings the pusher blade about
-                 z, so one blade can push along any heading instead of only
-                 along +/-x and +/-y.
+       Jaw axis: a slide along the (1,1) diagonal that carries the second of two
+                 L brackets toward or away from the first, opening and closing
+                 the pocket between them.
 
-       The linear axes are modeled as DIRECT LINEAR ACTUATORS and the rotary one
-       as a direct rotary actuator -- a <motor> on the joint, force in N or
-       torque in N*m. There is deliberately no motor, belt, pulley or leadscrew
+       All three are modeled as DIRECT LINEAR ACTUATORS -- a <motor> on a slide
+       joint, force in N. There is deliberately no motor, gear, belt or leadscrew
        geometry: on real hardware that drivetrain sits between the controller and
        the axis, but from the controller's point of view an axis is "commanded
-       effort -> motion", which is exactly what these three joints are. What the
-       drivetrain *does* cost the controller is friction and reflected inertia,
-       and both are modeled: every joint has viscous `damping`, dry
-       `frictionloss` (config.AXIS_FRICTION, live-tunable from the GUI) and an
-       `armature`.
+       force -> motion", which is exactly what these three joints are. The motor
+       and its gearing live in item_sort_config as a torque/rpm conversion, not
+       as bodies here. What the drivetrain *does* cost the controller is friction
+       and reflected inertia, and both are modeled: every joint has viscous
+       `damping`, dry `frictionloss` (config.AXIS_FRICTION, live-tunable from the
+       GUI) and an `armature`.
 
-       The only part of the gantry that touches anything is the blade hanging
-       from the yaw hinge: it reaches from just above the platform surface up
-       past the top of a box, so boxes are moved purely by shoving them. Every
-       other gantry geom has contype/conaffinity = 0 (class "gantry"), so the
-       bridge and rails pass over the boxes.
+       The only parts of the gantry that touch anything are the two brackets
+       under the carriage. Each is a right angle of 1/4 in stock -- a plate
+       normal to x and a plate normal to y -- and they face each other across the
+       diagonal, so their four plates enclose a square pocket. Closing the jaw
+       squeezes a box into bracket A's corner; opening it releases. Since a plate
+       pushes off either face, the pair also shoves in +/-x and +/-y with the jaw
+       parked, so the machine can still work a box without gripping it. Both
+       brackets reach from just above the platform surface up past the top of a
+       box, so a box slides rather than tips. Every other gantry geom has
+       contype/conaffinity = 0 (class "gantry"), so the bridge and rails pass
+       over the boxes.
 
        Several dimensions here are live model fields the GUI writes at runtime
-       rather than fixed geometry -- blade width, box masses, box/platform
+       rather than fixed geometry -- bracket width, box masses, box/platform
        friction, joint frictionloss. The values in this file are the startup
        defaults from item_sort_config; see ItemSortSim for the setters. -->
   <compiler angle="radian"/>
@@ -33,6 +39,10 @@
        (100 Hz) lands on whole step counts. It is this fine because the blade is
        only 1/4 in thick: a coarser step lets it tunnel into a box face. -->
   <option timestep="0.001" gravity="0 0 -9.81" integrator="implicitfast"/>
+  <!-- The two brackets never touch each other -- config asserts
+       BRACKET_WIDTH_MAX <= JAW_OPENING_MIN, i.e. the jaw's stop comes before
+       their arms could cross -- so no contact exclusion is needed between them,
+       and any bracket-on-bracket contact that did appear would be a bug. -->
 
   <default>
     <geom friction="0.5 0.005 0.0001" rgba="0.60 0.60 0.65 1"/>
@@ -78,9 +88,10 @@
           rgba="0.72 0.70 0.66 1"/>
 
     <!-- Perimeter lip so a stray box cannot leave the platform. Inner faces at
-         |x| = |y| = 0.6096; the axis travel limits keep the blade clear of them
-         at any width and any yaw angle. 60 mm tall -- enough to stop a sliding
-         box without fouling the blade, whose underside is at z = 0.004. -->
+         |x| = |y| = 0.6096; the axis travel limits keep the brackets clear of
+         them at any width and any jaw offset. 60 mm tall -- enough to stop a
+         sliding box without fouling the brackets, whose undersides are at
+         z = 0.004. -->
     <geom name="wall_xp" type="box" pos=" 0.6196 0      0.03" size="0.01 0.6296 0.03"
           rgba="0.55 0.53 0.50 1"/>
     <geom name="wall_xn" type="box" pos="-0.6196 0      0.03" size="0.01 0.6296 0.03"
@@ -98,47 +109,74 @@
     <!-- X axis: bridge carriage spanning the platform in y, sliding in x.
          Ride height 0.162 puts its underside at 0.147, clear of a 5 in box
          (0.127 tall), so stock passes under the bridge.
-         Travel limit 0.45 < platform half (0.6096) - widest blade half (0.1524),
-         so the blade never reaches the lip. -->
+         Travel limit 0.44 < platform half (0.6096) - how far the tool reaches
+         from the carriage centre at its worst case (config.TOOL_REACH, 0.1665,
+         which is half the widest jaw opening plus the stock thickness), so the
+         brackets never reach the lip at any width or offset. -->
     <body name="bridge" pos="0 0 0.162">
-      <joint name="axis_x" type="slide" axis="1 0 0" range="-0.45 0.45"
+      <joint name="axis_x" type="slide" axis="1 0 0" range="-0.44 0.44"
              damping="12" frictionloss="1.5" armature="1.0"/>
       <geom class="gantry" type="box" size="0.030 0.52 0.015" mass="3.0"/>
 
       <!-- Y axis: smaller carriage riding along the bridge. Same travel as x;
-           the bridge is long enough (0.52 > 0.45 + carriage half) to carry it
+           the bridge is long enough (0.52 > 0.44 + carriage half) to carry it
            the whole way. -->
       <body name="carriage" pos="0 0 0">
-        <joint name="axis_y" type="slide" axis="0 1 0" range="-0.45 0.45"
+        <joint name="axis_y" type="slide" axis="0 1 0" range="-0.44 0.44"
                damping="6" frictionloss="0.8" armature="0.4"/>
         <geom class="gantry" type="box" size="0.050 0.060 0.015" mass="0.8"
               rgba="0.45 0.48 0.55 1"/>
 
-        <!-- Yaw axis: swings the blade about z through the carriage centre.
-             +/-100 deg, so a square-on push along either axis in either
-             direction is inside the travel with the end-stop margin applied.
-             The blade's own inertia is small (a thin plate, ~0.002 kg*m^2), so
-             `armature` -- the drive's reflected inertia -- dominates it; that is
-             what keeps the yaw axis's tuning from moving much when the width
-             slider changes the blade. -->
-        <body name="paddle_yaw" pos="0 0 0">
-          <joint name="axis_yaw" type="hinge" axis="0 0 1"
-                 range="-1.7453292519943295 1.7453292519943295"
-                 damping="0.5" frictionloss="0.05" armature="0.05"/>
+        <!-- ---------------- THE TOOL: two L brackets, one jaw ----------------
+             The gantry's ONLY colliding geometry. Both brackets are 1/4 in stock
+             standing on edge, hanging from the carriage underside (z = 0.147)
+             down to z = 0.004 (4 mm above the surface); the geoms are centred at
+             z = -0.0865 in the carriage frame with half-height 0.0715.
 
-          <!-- Pusher blade: the gantry's ONLY colliding geom. 1/4 in plate
-               standing on edge, hanging from the carriage underside (z = 0.147)
-               down to z = 0.004 (4 mm above the surface). Thickness is along
-               local x and width along local y, so at yaw = 0 it pushes in +/-x
-               and at yaw = 90 deg in +/-y. Full height, so it catches a box's
-               face low down and boxes slide rather than tip.
+             In each bracket, `_x` is the plate NORMAL to x (it spans y) and `_y`
+             the plate normal to y. A bracket's corner is where its two plates
+             meet; its arms run from that corner toward the other bracket, so the
+             four plates bound a square pocket:
 
-               `size[1]` (the width half-extent) and `mass` are rewritten live by
-               ItemSortSim.set_paddle_width from the GUI slider; the values here
-               are config.PADDLE_WIDTH / paddle_mass() at startup. -->
-          <geom name="paddle" type="box" pos="0 0 -0.0865"
-                size="0.003175 0.1016 0.0715" mass="0.4999"
+                 x = A corner   <- box ->   x = B corner
+                 y = A corner   <- box ->   y = B corner
+
+             All four geom `size`s and `pos`es, and both bodies' masses, are
+             rewritten live by ItemSortSim.set_bracket_width; the values here are
+             config.BRACKET_WIDTH / bracket_arm_mass() at startup, with the
+             corners at config.BRACKET_A_CORNER / BRACKET_B_CORNER. -->
+
+        <!-- Bracket A: fixed. No joint, so it is welded to the carriage -- a
+             separate body only so its mass stays separately writable, since the
+             width slider is meant to be felt as a mass change on x and y. Its
+             corner IS the tool's reference point; the pocket grows away from it
+             in +x and +y as the jaw opens. -->
+        <body name="bracket_a" pos="0 0 0">
+          <geom name="bracket_a_x" type="box" pos="-0.163279 -0.134704 -0.0865"
+                size="0.003175 0.025400 0.0715" mass="0.124968"
                 rgba="0.85 0.65 0.20 1" friction="0.6 0.005 0.0001"/>
+          <geom name="bracket_a_y" type="box" pos="-0.134704 -0.163279 -0.0865"
+                size="0.025400 0.003175 0.0715" mass="0.124968"
+                rgba="0.85 0.65 0.20 1" friction="0.6 0.005 0.0001"/>
+        </body>
+
+        <!-- Bracket B: the moving jaw. Slides along the (1,1) diagonal, which
+             MuJoCo normalises, so the joint coordinate is the actuator's stroke
+             in metres and it opens the pocket by stroke/sqrt(2) in each of x and
+             y (config.jaw_opening). Range is +/-JAW_TRAVEL about a mid-stroke
+             zero, matching every other axis here.
+
+             Lighter armature and damping than the slides: this axis moves one
+             bracket, not a bridge. -->
+        <body name="bracket_b" pos="0 0 0">
+          <joint name="axis_jaw" type="slide" axis="1 1 0" range="-0.17 0.17"
+                 damping="5" frictionloss="0.6" armature="0.3"/>
+          <geom name="bracket_b_x" type="box" pos="0.043071 0.014496 -0.0865"
+                size="0.003175 0.025400 0.0715" mass="0.124968"
+                rgba="0.90 0.45 0.20 1" friction="0.6 0.005 0.0001"/>
+          <geom name="bracket_b_y" type="box" pos="0.014496 0.043071 -0.0865"
+                size="0.025400 0.003175 0.0715" mass="0.124968"
+                rgba="0.90 0.45 0.20 1" friction="0.6 0.005 0.0001"/>
         </body>
       </body>
     </body>
@@ -199,16 +237,17 @@
   </contact>
 
   <!-- Actuator order defines the axis vector used everywhere (AXIS_NAMES):
-       [x, y, yaw]. N on the slides, N*m on the hinge; ctrlrange must match
+       [x, y, jaw]. N on all three slides; ctrlrange must match
        config.MAX_FORCE. -->
   <actuator>
     <motor name="axis_x"   joint="axis_x"   ctrlrange="-120 120"/>
     <motor name="axis_y"   joint="axis_y"   ctrlrange="-80 80"/>
-    <motor name="axis_yaw" joint="axis_yaw" ctrlrange="-20 20"/>
+    <motor name="axis_jaw" joint="axis_jaw" ctrlrange="-60 60"/>
   </actuator>
 
-  <!-- No <keyframe>: the nominal initial state is "gantry centred, blade square
-       on, box pool parked", which is what the bodies above already declare, and
+  <!-- No <keyframe>: the nominal initial state is "gantry centred, jaw at
+       mid-stroke, box pool parked", which is what the bodies above already
+       declare, and
        ItemSortSim.reset_state parks every box explicitly anyway. A keyframe
        would mean maintaining all 13 box poses in a second place. -->
 </mujoco>
