@@ -14,9 +14,11 @@ has two linear axes and one rotary one, so the axis vector is mixed.
 AXIS_UNITS / EFFORT_UNITS spell that out for anything that has to print it. The
 command vector is still called "force" throughout (MAX_FORCE, set_force,
 max_force) because that is what MuJoCo calls every actuator output regardless of
-joint type -- on the yaw axis, read those entries as torque in N*m. Nothing here
-uses revolutions: unlike ../balance_bot and ../biped, which follow the moteus
-convention (rev, rev/s, Nm), the rotary axis here is plain radians.
+joint type -- on the yaw axis, read those entries as torque in N*m. The joint
+side stays in plain radians: unlike ../balance_bot and ../biped, which follow the
+moteus convention (rev, rev/s, Nm), nothing here commands revolutions. Revs
+appear in one place only, the motor-side rpm readout in the Drivetrain section,
+because rpm is how a motor's datasheet is written.
 
 The machine is specified in imperial (a 4 ft platform, 3/6/12 in boxes, a 1/4 in
 blade) because that is how the real thing would be built and how the stock
@@ -69,11 +71,82 @@ SOFT_TRAVEL = TRAVEL - END_STOP_MARGIN
 # anything above this is a lie to the controller.
 MAX_FORCE = np.array([120.0, 80.0, 20.0])
 
-# The limit the PID actually clamps its output to, per axis. Starts at the
-# actuator ceiling; the GUI exposes it as a slider (0 .. MAX_FORCE) so an axis
-# can be run soft -- useful for nudging a box instead of punting it, and for
-# seeing which of a PID's problems are really saturation.
-FORCE_LIMIT = MAX_FORCE.copy()
+# ---------------------------------------------------------------------------
+# Drivetrain: what actually produces the effort on each axis
+# ---------------------------------------------------------------------------
+# Every axis is a motor rigidly linked to what it moves -- x and y through a
+# pinion of pitch radius r driving the carriage, yaw through a gear pair of
+# reduction ratio N. **None of this is in item_sort.xml.** MuJoCo still sees a
+# plain force/torque actuator on each joint; the drivetrain lives here as the
+# conversion between the motor's world (shaft torque, rpm -- how a motor is
+# specified and bought) and the joint's (N or N*m, m/s or rad/s -- what the PID
+# and the physics deal in):
+#
+#   linear axis (x, y)   F = tau / r      omega = v / r
+#   rotary axis (yaw)    T = tau * N      omega = w * N
+#
+# Both directions are the same single number per axis, `gear_gain` below: axis
+# effort per N*m of motor torque, and motor rad/s per unit of axis speed. Adding
+# gear geometry to the model would buy nothing the controller can see, and would
+# cost a stiff constraint in the solver.
+#
+# The default r puts the default motor torque exactly at MAX_FORCE, so out of
+# the box the axes drive as hard as the actuators allow.
+GEAR_IS_RADIUS = np.array([True, True, False])   # yaw's gear is a plain ratio
+
+MOTOR_TORQUE = np.array([2.4, 1.6, 20.0])        # N*m at the shaft, per axis
+MOTOR_TORQUE_MAX = np.array([6.0, 4.0, 50.0])    # slider ceilings
+
+GEAR = np.array([0.020, 0.020, 1.0])             # m on x/y, ratio on yaw
+GEAR_MIN = np.array([0.005, 0.005, 0.2])
+GEAR_MAX = np.array([0.060, 0.060, 5.0])
+
+# How the GUI writes the gear number: radii read in mm, the ratio as itself.
+GEAR_LABELS = ("gear radius", "gear radius", "gear ratio")
+GEAR_UNITS = ("mm", "mm", ":1")
+GEAR_SCALE = np.array([1000.0, 1000.0, 1.0])     # SI -> slider units
+
+MOTOR_UNITS = ("N*m",) * N_AXES                  # motor-side torque, every axis
+RPM_UNITS = ("rpm",) * N_AXES
+RAD_S_TO_RPM = 60.0 / (2.0 * np.pi)
+
+
+def gear_gain(gear):
+    """Axis effort per N*m of motor torque -- which is also motor rad/s per unit
+    of axis speed, since a rigid link cannot trade one without the other.
+
+    `gear` is the per-axis gear number in SI (pitch radius in m on x and y, a
+    dimensionless ratio on yaw). It is clamped into its usable range first, so a
+    radius can never reach zero and hand an axis infinite force.
+    """
+    gear = np.clip(np.asarray(gear, dtype=float), GEAR_MIN, GEAR_MAX)
+    return np.where(GEAR_IS_RADIUS, 1.0 / gear, gear)
+
+
+def axis_effort_limit(torque, gear):
+    """What the drivetrain can put on each axis (N, N, N*m), capped by what the
+    actuator itself can deliver -- gearing for more force than MAX_FORCE just
+    gets clipped by MuJoCo, silently, so cap it here where it is visible."""
+    return np.minimum(np.asarray(torque, dtype=float) * gear_gain(gear), MAX_FORCE)
+
+
+def motor_torque(effort, gear):
+    """Shaft torque (N*m) behind a given axis effort (N, N, N*m)."""
+    return np.asarray(effort, dtype=float) / gear_gain(gear)
+
+
+def motor_rpm(vel, gear):
+    """Shaft speed (rev/min) at a given axis speed (m/s, m/s, rad/s)."""
+    return np.asarray(vel, dtype=float) * gear_gain(gear) * RAD_S_TO_RPM
+
+
+# The limit the PID actually clamps its output to, per axis: whatever the motor
+# and its gearing can deliver, never more than the actuator ceiling. The GUI
+# drives this through the torque and gear sliders rather than setting it
+# directly -- an axis is run soft by fitting a smaller motor or regearing it, not
+# by wishing the force away.
+FORCE_LIMIT = axis_effort_limit(MOTOR_TORQUE, GEAR)
+
 
 # Dry (Coulomb) friction in each axis (N, N, N*m): the effort the drive has to
 # overcome before the axis moves at all, independent of speed. This is MuJoCo's
