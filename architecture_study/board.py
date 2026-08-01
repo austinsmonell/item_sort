@@ -14,9 +14,9 @@ geometry is the intended next step, and it belongs here — it is a new test in
 """
 
 import math
-from typing import Iterator, List, Optional, Sequence, Tuple
+from typing import Iterator, List, Sequence, Tuple
 
-from geometry import Rect
+from geometry import EPS, Rect
 from puzzle_state import Cell, PuzzleState
 
 # Four-connected motion.  Diagonals are left out so that every step costs the
@@ -54,6 +54,20 @@ class Board:
                 raise InvalidLayout(f"box {name} ({w} x {h} m) does not fit the arena")
             self._max_cell.append((mx, my))
 
+        # Configuration-space overlap ranges.  Box i at cell (cx, cy) overlaps
+        # box j at (jx, jy) exactly when
+        #     jx + back_x[i] <= cx <= jx + fwd_x[j]   (and the same in y).
+        # Both offsets fall straight out of the float overlap test and depend
+        # only on the two box widths, never on where either box is — so the hot
+        # loop is four integer comparisons per pair instead of two rectangles
+        # built and four float comparisons.  `_verify_cspace` proves the two
+        # agree.
+        self._back_x = [int(math.floor(-(w - EPS) / step)) + 1 for w, _ in self.sizes]
+        self._back_y = [int(math.floor(-(h - EPS) / step)) + 1 for _, h in self.sizes]
+        self._fwd_x = [int(math.ceil((w - EPS) / step)) - 1 for w, _ in self.sizes]
+        self._fwd_y = [int(math.ceil((h - EPS) / step)) - 1 for _, h in self.sizes]
+        self._verify_cspace()
+
         self.initial = PuzzleState(
             tuple(self.snap_corner(i, b[1], b[2]) for i, b in enumerate(boxes))
         )
@@ -78,44 +92,92 @@ class Board:
     def rects(self, state: PuzzleState) -> List[Rect]:
         return [self.rect(i, c) for i, c in enumerate(state.cells)]
 
+    def max_cell(self, box: int) -> Cell:
+        """Highest legal cell index for `box`, ignoring the other boxes."""
+        return self._max_cell[box]
+
+    def clamp(self, box: int, cell: Cell) -> Cell:
+        """Nearest cell to `cell` that keeps `box` inside the arena."""
+        mx, my = self._max_cell[box]
+        return (min(max(cell[0], 0), mx), min(max(cell[1], 0), my))
+
     # ------------------------------------------------------------------ rules
 
     def in_bounds(self, box: int, cell: Cell) -> bool:
         mx, my = self._max_cell[box]
         return 0 <= cell[0] <= mx and 0 <= cell[1] <= my
 
-    def _fits(self, state: PuzzleState, box: int, cell: Cell,
-              rects: Optional[List[Rect]] = None) -> bool:
+    def boxes_overlap(self, i: int, ci: Cell, j: int, cj: Cell) -> bool:
+        """True when box `i` at cell `ci` would overlap box `j` at cell `cj`.
+
+        Integer-only equivalent of `self.rect(i, ci).overlaps(self.rect(j, cj))`.
+        """
+        cx, cy = ci
+        jx, jy = cj
+        return (jx + self._back_x[i] <= cx <= jx + self._fwd_x[j]
+                and jy + self._back_y[i] <= cy <= jy + self._fwd_y[j])
+
+    def can_place(self, state: PuzzleState, box: int, cell: Cell) -> bool:
         """True when `box` may occupy `cell` given where everything else is.
 
         This is the whole legality rule, and the one place a future mechanism
-        model (swept volume, approach direction) would hook into.  `rects` lets a
-        caller pass the current layout it has already built, which matters
-        because the search calls this four times per box per expansion.
+        model (swept volume, approach direction, stand-off clearance) would hook
+        into.  It is also the hottest function in the study — the search calls it
+        four times per box per expansion — hence the inlined integer form.
         """
-        if not self.in_bounds(box, cell):
+        cx, cy = cell
+        mx, my = self._max_cell[box]
+        if not (0 <= cx <= mx and 0 <= cy <= my):
             return False
-        if rects is None:
-            rects = self.rects(state)
-        candidate = self.rect(box, cell)
-        for other in range(self.count):
-            if other != box and candidate.overlaps(rects[other]):
+        back_x = self._back_x[box]
+        back_y = self._back_y[box]
+        fwd_x = self._fwd_x
+        fwd_y = self._fwd_y
+        for j, (jx, jy) in enumerate(state.cells):
+            if j == box:
+                continue
+            if (jx + back_x <= cx <= jx + fwd_x[j]
+                    and jy + back_y <= cy <= jy + fwd_y[j]):
                 return False
         return True
 
     def is_valid(self, state: PuzzleState) -> bool:
-        rects = self.rects(state)
-        return all(self._fits(state, i, c, rects) for i, c in enumerate(state.cells))
+        return all(self.can_place(state,i, c) for i, c in enumerate(state.cells))
 
     def neighbors(self, state: PuzzleState) -> Iterator[tuple]:
         """Yield (next_state, box, (dx, dy), distance) for every legal step."""
-        rects = self.rects(state)
+        step = self.step
         for box in range(self.count):
             cx, cy = state.cells[box]
             for dx, dy in DIRECTIONS:
                 cell = (cx + dx, cy + dy)
-                if self._fits(state, box, cell, rects):
-                    yield state.with_move(box, dx, dy), box, (dx, dy), self.step
+                if self.can_place(state,box, cell):
+                    yield state.with_move(box, dx, dy), box, (dx, dy), step
+
+    def _verify_cspace(self):
+        """Assert the integer overlap ranges agree with the float geometry.
+
+        The ranges are an optimisation of `Rect.overlaps`, and a slip in the
+        derivation would not crash — it would quietly emit plans that overlap
+        boxes.  Translation invariance means one reference position per pair
+        covers every case, so the whole check is a few thousand comparisons at
+        construction.
+        """
+        base = (5, 5)
+        for i in range(self.count):
+            for j in range(self.count):
+                if i == j:
+                    continue
+                rj = self.rect(j, base)
+                for cx in range(base[0] + self._back_x[i] - 1,
+                                base[0] + self._fwd_x[j] + 2):
+                    for cy in range(base[1] + self._back_y[i] - 1,
+                                    base[1] + self._fwd_y[j] + 2):
+                        if (self.boxes_overlap(i, (cx, cy), j, base)
+                                != self.rect(i, (cx, cy)).overlaps(rj)):
+                            raise InvalidLayout(
+                                f"c-space range for boxes {i}/{j} disagrees with "
+                                f"the rectangle test at cell {(cx, cy)}")
 
     # ------------------------------------------------------- metres <-> cells
 

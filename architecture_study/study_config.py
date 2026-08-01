@@ -1,4 +1,4 @@
-"""Shared constants for the study — arena, boxes, grid and default weights.
+"""Shared constants for the study — arena, box catalogue, grid and weights.
 
 Every module reads its defaults from here so the planner and the GUI cannot
 disagree.  Lengths are metres throughout.
@@ -8,23 +8,28 @@ from geometry import Rect
 
 # --------------------------------------------------------------------- layout
 
-ARENA = Rect(0.0, 0.0, 1.20, 0.80)
+ARENA = Rect(0.0, 0.0, 1.8, 1.2)
 
-# (name, x, y, w, h) — x, y is the lower-left corner.  Corners are snapped to the
-# grid at load time, so a layout that only fits on a fine grid will be rejected
-# when the grid is coarsened.
-BOXES = [
-    ("A", 0.08, 0.08, 0.20, 0.16),
-    ("B", 0.40, 0.08, 0.32, 0.12),
-    ("C", 0.84, 0.08, 0.16, 0.28),
-    ("D", 0.12, 0.44, 0.24, 0.20),
-    ("E", 0.52, 0.36, 0.12, 0.12),
-    ("F", 0.76, 0.52, 0.28, 0.16),
-]
+# The standard box catalogue: (type name, side length).  Boxes are squares, and
+# a layout is described by how many of each type you want rather than by
+# hand-written rectangles — see layout.LayoutGenerator.
+BOX_TYPES = (
+    ("small", 0.10),
+    ("medium", 0.20),
+    ("large", 0.30),
+)
+
+DEFAULT_COUNTS = {"small": 4, "medium": 3, "large": 2}
+MAX_COUNT_PER_TYPE = 40
+
+# Random placement tries this many cells per box before giving up and reporting
+# that the layout will not fit.
+PLACEMENT_ATTEMPTS = 500
+RANDOM_SEED = None  # pin to an integer for a repeatable starting layout
 
 # Box corners may only sit on multiples of this.  It is the single biggest lever
 # on search time: halving it quadruples the reachable layouts.
-GRID_STEP = 0.04
+GRID_STEP = 0.05
 GRID_STEP_RANGE = (0.02, 0.10)
 
 # ---------------------------------------------------------------- cost weights
@@ -45,11 +50,15 @@ MAX_NODES_RANGE = (20_000, 400_000)
 # -------------------------------------------------------------------- display
 
 WINDOW_TITLE = "A* rectangle sorting study"
-CANVAS_SIZE = (760, 520)
+CANVAS_SIZE = (820, 560)
 PLAYBACK_MS = 40          # milliseconds per animated grid step
 PLAYBACK_MS_RANGE = (5, 200)
 
-BOX_COLORS = [
-    "#4C78A8", "#F58518", "#54A24B", "#E45756",
-    "#72B7B2", "#B279A2", "#EECA3B", "#9D755D",
-]
+# Boxes are coloured by type, so the three standard sizes stay readable however
+# many of them are on the floor.
+BOX_TYPE_COLORS = {
+    "small": "#54A24B",
+    "medium": "#4C78A8",
+    "large": "#E45756",
+}
+FALLBACK_BOX_COLOR = "#B279A2"

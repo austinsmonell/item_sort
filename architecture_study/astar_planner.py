@@ -73,12 +73,17 @@ class AStarPlanner:
         counter = itertools.count()
         best: Dict[PuzzleState, float] = {start: 0.0}
         came: Dict[PuzzleState, Tuple[PuzzleState, Move]] = {}
-        open_heap = [(cost.heuristic(board, start, target, goal), next(counter), start)]
+        # Heap key: (f, -g, tie-break counter, state).  Preferring the larger g
+        # among equal-f nodes drives the search at the goal instead of fanning
+        # out across a plateau of equally promising layouts; the counter keeps
+        # states themselves out of the comparison.
+        open_heap = [(cost.heuristic(board, start, target, goal), -0.0,
+                      next(counter), start)]
         closed = set()
         generated = 0
 
         while open_heap:
-            _, _, state = heapq.heappop(open_heap)
+            _, _, _, state = heapq.heappop(open_heap)
             if state in closed:
                 continue
             closed.add(state)
@@ -113,7 +118,7 @@ class AStarPlanner:
                     best[nxt] = ng
                     came[nxt] = (state, Move(box, delta, distance))
                     f = ng + cost.heuristic(board, nxt, target, goal)
-                    heapq.heappush(open_heap, (f, next(counter), nxt))
+                    heapq.heappush(open_heap, (f, -ng, next(counter), nxt))
 
         return Plan(False, "no legal sequence of moves reaches that goal",
                     nodes_expanded=len(closed), nodes_generated=generated,

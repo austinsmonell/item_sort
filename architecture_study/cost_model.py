@@ -37,18 +37,48 @@ class CostModel:
     def heuristic(self, board, state, target: int, goal) -> float:
         """Optimistic cost from `state` to having `target` sit on `goal`.
 
-        The target box must itself travel at least the Manhattan distance to the
-        goal (moves are four-connected and cost the same per metre whichever box
-        makes them), and if it is not already the box in hand that travel needs
-        at least one more grip.  Both terms understate the truth, so at
-        heuristic_weight = 1.0 the search stays admissible.
+        Two sources of guaranteed remaining cost:
+
+        * The target must itself travel at least the Manhattan distance to the
+          goal (moves are four-connected and cost the same per metre whichever
+          box makes them), and unless it is already the box in hand that travel
+          needs a grip.
+
+        * Any box sitting on the goal footprint *provably* has to move, since
+          the target cannot end up overlapping it.  Each one needs at least
+          enough travel to stop overlapping, plus a grip of its own unless it is
+          the box already in hand.
+
+        Every term belongs to a different box and to a different grip, so they
+        add without ever overshooting the true remaining cost — which is what
+        keeps A* optimal at heuristic_weight = 1.0.  Ignoring boxes that merely
+        sit *between* the target and its goal is deliberate: the target may be
+        able to go around them, so charging for them would not be admissible.
         """
-        cx, cy = state.cells[target]
+        cells = state.cells
+        cx, cy = cells[target]
         steps = abs(goal[0] - cx) + abs(goal[1] - cy)
         if steps == 0:
             return 0.0
 
+        held = state.last_moved
         estimate = self.distance_weight * steps * board.step
-        if state.last_moved != target:
+        if held != target:
             estimate += self.regrip_weight
+
+        goal_rect = None
+        for j, cell in enumerate(cells):
+            if j == target or not board.boxes_overlap(target, goal, j, cell):
+                continue
+            if goal_rect is None:
+                goal_rect = board.rect(target, goal)
+            other = board.rect(j, cell)
+            # Shallowest way out of the goal footprint, in any of the four
+            # directions — a lower bound on how far this box must travel.
+            clearance = min(goal_rect.x2 - other.x, other.x2 - goal_rect.x,
+                            goal_rect.y2 - other.y, other.y2 - goal_rect.y)
+            estimate += self.distance_weight * clearance
+            if j != held:
+                estimate += self.regrip_weight
+
         return self.heuristic_weight * estimate
