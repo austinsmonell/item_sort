@@ -3,4 +3,5 @@ __pycache__/
 MUJOCO_LOG.TXT
 .vscode*
 *.md
-
+item_sort_cad/
+.claudeignore
