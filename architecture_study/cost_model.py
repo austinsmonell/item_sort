@@ -34,7 +34,8 @@ class CostModel:
             cost += self.regrip_weight
         return cost
 
-    def heuristic(self, board, state, target: int, goal) -> float:
+    def heuristic(self, board, state, target: int, goal,
+                  weight: float = None) -> float:
         """Optimistic cost from `state` to having `target` sit on `goal`.
 
         Two sources of guaranteed remaining cost:
@@ -81,4 +82,8 @@ class CostModel:
             if j != held:
                 estimate += self.regrip_weight
 
-        return self.heuristic_weight * estimate
+        # `weight` overrides the model's own inflation for one call, which is how
+        # the anytime planner gets both the raw admissible estimate (for its
+        # optimality bound) and an inflated one (for search order) without
+        # disturbing the shared model the GUI is editing.
+        return estimate * (self.heuristic_weight if weight is None else weight)

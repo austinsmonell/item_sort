@@ -17,8 +17,9 @@ import queue
 import threading
 import tkinter as tk
 
-from astar_planner import AStarPlanner
+from anytime_planner import AnytimePlanner
 from board import Board, InvalidLayout
+from decomposition import DecompositionPlanner
 from layout import LayoutFull
 from puzzle_state import PuzzleState
 
@@ -61,6 +62,7 @@ class PuzzleGUI:
         self._anim_job = None
         self._drag = None              # (box, grab offset x, grab offset y)
         self._drag_block = None        # cell the drag is currently refused
+        self._pending_plan = None      # improvement that arrived mid-playback
         self._scale = 1.0
         self._origin = (0.0, 0.0)
         self._canvas_h = 1
@@ -246,6 +248,7 @@ class PuzzleGUI:
         c.create_rectangle(x0, y0, x1, y1, fill=ARENA_FILL, outline=ARENA_EDGE,
                            width=2)
         self._draw_grid()
+        self._draw_plan_outcome()
         self._draw_path()
         self._draw_goal()
         self._draw_boxes()
@@ -303,6 +306,24 @@ class PuzzleGUI:
         self.canvas.create_text(cx, cy, text=f"{self.board.names[self.selected]}\ngoal",
                                 fill=color, font=("Segoe UI", 8, "bold"),
                                 justify=tk.CENTER)
+
+    def _draw_plan_outcome(self):
+        """Dashed outline of where every moved box ends up under the plan.
+
+        Drawn while the search is still improving, so the board shows what the
+        best plan so far actually achieves rather than just the route.
+        """
+        if self.plan is None or self.frame != 0 or len(self.plan.states) < 2:
+            return
+        final = self.plan.states[-1]
+        for box in self.plan.boxes_moved:
+            if final.cells[box] == self.state.cells[box]:
+                continue
+            rect = self.board.rect(box, final.cells[box])
+            x0, y0 = self._px(rect.x, rect.y2)
+            x1, y1 = self._px(rect.x2, rect.y)
+            self.canvas.create_rectangle(x0, y0, x1, y1, dash=(3, 3),
+                                         outline=self._color(rect.w), width=2)
 
     def _draw_path(self):
         if self.plan is None or self.selected is None or len(self.plan.states) < 2:
@@ -495,49 +516,101 @@ class PuzzleGUI:
     def _on_plan(self):
         if self._busy():
             self._cancel.set()
-            self._say("cancelling search…")
+            self._say("stopping — the best plan found so far is kept…")
             return
         if self.selected is None or self.goal is None:
             self._warn("select a box and place a goal first")
             return
 
         self._stop_playback()
+        self.plan = None               # the old plan is about to be replaced
+        self._pending_plan = None
+        self.frame = 0
         self.cost.distance_weight = float(self.s_distance.get())
         self.cost.regrip_weight = float(self.s_regrip.get())
         self.cost.heuristic_weight = float(self.s_heuristic.get())
 
-        planner = AStarPlanner(self.board, self.cost, int(self.s_nodes.get()))
+        planner = AnytimePlanner(self.board, self.cost, int(self.s_nodes.get()))
         self._cancel = threading.Event()
         start, target, goal = self.state, self.selected, self.goal
 
+        finder = DecompositionPlanner(self.board, self.cost)
+
         def work():
-            self._results.put(planner.plan(start, target, goal, self._cancel))
+            # Decomposition first: it answers "is there a way at all" in about a
+            # millisecond, and that plan goes on the board before the optimiser
+            # has done anything.  It then seeds the search, so every round is
+            # priced against a real plan from its first node.
+            seed = finder.plan(start, target, goal)
+            if seed is not None:
+                self._results.put(("better", seed))
+            # Each further improvement is posted the moment it is found.
+            planner.plan(start, target, goal, self._cancel,
+                         on_improve=lambda plan: self._results.put(
+                             ("better", plan)),
+                         seed=seed)
+            self._results.put(("done", None))
 
         self._worker = threading.Thread(target=work, daemon=True)
-        self.btn_plan.config(text="Cancel search")
-        self._say(f"planning a move of {self.board.names[target]}…")
+        self.btn_plan.config(text="Stop optimising — keep best")
+        self._say(f"looking for any way to move "
+                  f"{self.board.names[target]}…")
         self.var_result.set("searching…")
         self._worker.start()
         self.root.after(60, self._poll)
 
     def _poll(self):
-        try:
-            plan = self._results.get_nowait()
-        except queue.Empty:
+        """Drain everything the worker has posted, newest plan wins."""
+        finished = False
+        improved = False
+        while True:
+            try:
+                kind, plan = self._results.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "better":
+                self._adopt_plan(plan)
+                improved = True
+            else:
+                finished = True
+
+        if improved:
+            self._redraw()
+        if not finished:
             self.root.after(60, self._poll)
             return
 
         self.btn_plan.config(text="Plan move")
-        if plan.found:
-            self.plan = plan
-            self.frame = 0
-            self.state = plan.states[0]
-            self._say(f"{len(plan.moves)} steps — press Play")
+        if self.plan is None:
+            self._warn("no plan found — raise the node budget, coarsen the "
+                       "grid, or pick a nearer goal")
+            self.var_result.set("no plan")
+        elif self._cancel.is_set():
+            self._say(f"stopped — keeping the best plan found "
+                      f"({len(self.plan.moves)} steps). Press Play.")
         else:
-            self.plan = None
-            self._warn(plan.message)
-        self._show_result(plan)
+            self._say(f"{self.plan.message} — {len(self.plan.moves)} steps. "
+                      "Press Play.")
         self._redraw()
+
+    def _adopt_plan(self, plan):
+        """Show a newly improved plan, without disturbing playback in progress."""
+        if self.playing:
+            # Watching the previous one — let it finish rather than yanking the
+            # board out from under it.
+            self._pending_plan = plan
+            self._say(f"better plan found: cost {plan.cost:.3f} "
+                      f"(applies when playback stops)")
+            return
+        self.plan = plan
+        self.frame = 0
+        self.state = plan.states[0]
+        self._pending_plan = None
+        self._show_result(plan)
+        quality = ("feasible" if plan.bound == float("inf")
+                   else f"within {plan.bound:g}x optimal")
+        self._say(f"cost {plan.cost:.3f}, {quality} — still improving; "
+                  "Stop to keep this one")
 
     def _show_result(self, plan):
         if not plan.found:
@@ -550,7 +623,15 @@ class PuzzleGUI:
             return
 
         names = ", ".join(self.board.names[b] for b in plan.boxes_moved) or "none"
+        if plan.bound == float("inf"):
+            quality = "feasible — not yet bounded"
+        elif plan.bound <= 1.0 + 1e-9:
+            quality = "proven optimal"
+        else:
+            quality = f"within {plan.bound:g}x of optimal"
         lines = [
+            f"{quality}",
+            "",
             f"steps          {len(plan.moves):>10,}",
             f"boxes moved    {len(plan.boxes_moved):>10}",
             f"  {names}",
@@ -589,7 +670,14 @@ class PuzzleGUI:
         if not self.playing or self.plan is None:
             return
         if self.frame >= len(self.plan.states) - 1:
-            self._stop_playback()
+            # The plan has been carried out, so the board is at a new layout.
+            # Anything the optimiser is still working on was planned from the
+            # *old* one and no longer applies — drop it and stop the search
+            # rather than silently rewinding the floor.
+            self._stop_playback(adopt=False)
+            self._pending_plan = None
+            if self._busy():
+                self._cancel.set()
             self.home = self.state
             self._say("plan complete — the layout is now the new start")
             return
@@ -598,12 +686,19 @@ class PuzzleGUI:
         self._redraw()
         self._anim_job = self.root.after(int(self.s_speed.get()), self._tick)
 
-    def _stop_playback(self):
+    def _stop_playback(self, adopt=True):
         self.playing = False
         if self._anim_job is not None:
             self.root.after_cancel(self._anim_job)
             self._anim_job = None
         self.btn_play.config(text="Play")
+        if adopt and self._pending_plan is not None:
+            # A better plan turned up while this one was playing, and playback
+            # was interrupted rather than finished — the board is still at the
+            # layout that plan starts from, so it can be swapped in.
+            pending, self._pending_plan = self._pending_plan, None
+            self._adopt_plan(pending)
+            self._redraw()
 
     def _on_step(self):
         if self.plan is None:

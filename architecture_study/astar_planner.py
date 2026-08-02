@@ -47,6 +47,9 @@ class Plan:
     nodes_expanded: int = 0
     nodes_generated: int = 0
     elapsed: float = 0.0
+    # Suboptimality guarantee: this plan costs at most `bound` times the best
+    # possible one.  1.0 means proven optimal.
+    bound: float = 1.0
 
     @property
     def boxes_moved(self) -> List[int]:
@@ -129,37 +132,50 @@ class AStarPlanner:
     def _reconstruct(self, start: PuzzleState, goal_state: PuzzleState,
                      came: Dict[PuzzleState, Tuple[PuzzleState, Move]],
                      expanded: int, generated: int, elapsed: float) -> Plan:
-        moves: List[Move] = []
-        states: List[PuzzleState] = [goal_state]
-        node = goal_state
-        while node in came:
-            node, move = came[node]
-            moves.append(move)
-            states.append(node)
-        moves.reverse()
-        states.reverse()
+        return reconstruct(self.cost, start, goal_state, came, expanded,
+                           generated, elapsed)
 
-        distance_by_box: Dict[int, float] = {}
-        regrips = 0
-        previous = start.last_moved
-        total_cost = 0.0
-        for move in moves:
-            regrip = move.box != previous
-            regrips += int(regrip)
-            total_cost += self.cost.move_cost(move.distance, regrip)
-            distance_by_box[move.box] = distance_by_box.get(move.box, 0.0) + move.distance
-            previous = move.box
 
-        return Plan(
-            found=True,
-            message="plan found" if moves else "box is already on the goal",
-            moves=moves,
-            states=states,
-            cost=total_cost,
-            distance=sum(distance_by_box.values()),
-            regrips=regrips,
-            distance_by_box=distance_by_box,
-            nodes_expanded=expanded,
-            nodes_generated=generated,
-            elapsed=elapsed,
-        )
+def reconstruct(cost: CostModel, start: PuzzleState, goal_state: PuzzleState,
+                came: Dict[PuzzleState, Tuple[PuzzleState, Move]],
+                expanded: int, generated: int, elapsed: float) -> Plan:
+    """Walk the predecessor chain back into a plan, and price it.
+
+    Shared with `anytime_planner` so the two cannot disagree about what a plan
+    costs — the cost is always recomputed from the moves themselves rather than
+    carried along from the search.
+    """
+    moves: List[Move] = []
+    states: List[PuzzleState] = [goal_state]
+    node = goal_state
+    while node in came:
+        node, move = came[node]
+        moves.append(move)
+        states.append(node)
+    moves.reverse()
+    states.reverse()
+
+    distance_by_box: Dict[int, float] = {}
+    regrips = 0
+    previous = start.last_moved
+    total_cost = 0.0
+    for move in moves:
+        regrip = move.box != previous
+        regrips += int(regrip)
+        total_cost += cost.move_cost(move.distance, regrip)
+        distance_by_box[move.box] = distance_by_box.get(move.box, 0.0) + move.distance
+        previous = move.box
+
+    return Plan(
+        found=True,
+        message="plan found" if moves else "box is already on the goal",
+        moves=moves,
+        states=states,
+        cost=total_cost,
+        distance=sum(distance_by_box.values()),
+        regrips=regrips,
+        distance_by_box=distance_by_box,
+        nodes_expanded=expanded,
+        nodes_generated=generated,
+        elapsed=elapsed,
+    )

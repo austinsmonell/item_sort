@@ -117,6 +117,18 @@ class Board:
         return (jx + self._back_x[i] <= cx <= jx + self._fwd_x[j]
                 and jy + self._back_y[i] <= cy <= jy + self._fwd_y[j])
 
+    def overlap_range(self, i: int, j: int, cj: Cell) -> Tuple[int, int, int, int]:
+        """Inclusive cell range (lo_x, hi_x, lo_y, hi_y) in which box `i` would
+        overlap box `j` sitting at `cj`.
+
+        The rectangular shadow one box casts in another's configuration space.
+        `boxes_overlap` answers this a cell at a time; this hands over the whole
+        rectangle, which is what lets the decomposition planner paint a blocked
+        region in one go.
+        """
+        return (cj[0] + self._back_x[i], cj[0] + self._fwd_x[j],
+                cj[1] + self._back_y[i], cj[1] + self._fwd_y[j])
+
     def can_place(self, state: PuzzleState, box: int, cell: Cell) -> bool:
         """True when `box` may occupy `cell` given where everything else is.
 
