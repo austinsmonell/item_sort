@@ -21,6 +21,7 @@ from anytime_planner import AnytimePlanner
 from board import Board, InvalidLayout
 from decomposition import DecompositionPlanner
 from layout import LayoutFull
+from plan_repair import PlanRepairer
 from puzzle_state import PuzzleState
 
 LABEL_FONT = ("Segoe UI", 9)
@@ -535,15 +536,24 @@ class PuzzleGUI:
         start, target, goal = self.state, self.selected, self.goal
 
         finder = DecompositionPlanner(self.board, self.cost)
+        repairer = PlanRepairer(self.board, self.cost)
 
         def work():
             # Decomposition first: it answers "is there a way at all" in about a
             # millisecond, and that plan goes on the board before the optimiser
-            # has done anything.  It then seeds the search, so every round is
-            # priced against a real plan from its first node.
+            # has done anything.
             seed = finder.plan(start, target, goal)
             if seed is not None:
                 self._results.put(("better", seed))
+                # Then tidy that route up directly — dropping shoves that turned
+                # out to be unnecessary and rolling stop-start driving into one
+                # run.  Milliseconds, and it works where the search cannot: it
+                # edits the plan instead of hunting for a different one.
+                tidied = repairer.refine(start, target, goal, seed)
+                if tidied.cost < seed.cost - 1e-9:
+                    seed = tidied
+                    self._results.put(("better", seed))
+            # Finally the search, priced against that plan from its first node.
             # Each further improvement is posted the moment it is found.
             planner.plan(start, target, goal, self._cancel,
                          on_improve=lambda plan: self._results.put(
