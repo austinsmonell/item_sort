@@ -1,36 +1,45 @@
-"""Find *a* way to move a box, fast, by asking a much smaller question.
+"""Find *a* way to move a box, fast, by driving it and clearing as it goes.
 
 A* searches the joint space of every box position at once.  That is what makes it
-optimal and what makes it hopeless on a crowded floor: a goal that takes 19 nodes
-with 24 boxes cannot be reached at all with 32, and no amount of heuristic
-weighting rescues it — measured, an obstruction-counting heuristic bought 1.4x on
-boards that already worked and nothing on the ones that did not.
+optimal and what makes it hopeless on a crowded floor — and it is not a heuristic
+problem: an obstruction-counting heuristic bought 1.4x on boards that already
+worked and nothing at all on the ones that did not.
 
-So this asks a different question, the one from Stilman & Kuffner's work on
-navigation among movable obstacles:
+So this asks a smaller question, in the spirit of Stilman & Kuffner's work on
+navigation among movable obstacles.  The important part is *when* it asks:
 
-  1. Route the target to its goal as if the other boxes were not there.  One
-     box, a few hundred cells, breadth-first — microseconds.
-  2. See which boxes that route runs through.
-  3. Shove each of them clear of the whole route.  A box that is itself hemmed
-     in is the same problem one level down: work out what is pinning it, clear
-     that first, then come back.
-  4. If some box simply cannot be cleared, make the target treat it as a wall
-     and route again.
+    route      work out where the target would go if the other boxes were not
+               there — one box, a few hundred cells, breadth-first.
+    drive      move it along that route as far as it legally can *right now*.
+    clear      it is now nose-to-nose with one box.  Shove that box out of the
+               way of the route the target has *left to drive*.
+    repeat     drive on.  Re-evaluate after every shove.
 
-Cost tracks the number of *obstructions* — usually two to five — rather than the
-number of boxes on the floor, which is why it survives a density that stops A*
-outright.
+Driving before clearing is what makes it robust, and it is worth being precise
+about why.  Clearing the whole corridor up front demands that every box in the
+target's way find a home outside the *entire* route, which on a packed floor
+often has no solution at all.  Clearing as it goes asks for much less:
 
-This is deliberately only a feasibility finder.  It does not try to be cheap, it
-tries to be quick and to succeed; `AnytimePlanner` takes the plan it produces as
-a starting incumbent and improves it against the real cost function, with a
-bound.  That split is the point: this answers "is there a way, and what is it",
-and the optimiser answers "how good can it get".
+  * the keep-out region shrinks every time the target advances, so boxes met
+    late need to clear almost nothing;
+  * cells the target has already driven past are free to park in — a box can be
+    shoved into the space right behind it;
+  * the target physically moves between shoves, so the floor a box is escaping
+    into is the real one at that moment, not a worst-case snapshot.
 
-What it will not find: plans needing a box shoved twice, or needing the target to
-move partway before a box can be cleared.  Every displaced box moves once, and
-the target goes last.
+A box may be shoved more than once — if it gets in the way again later, it is
+simply cleared again.  A box that is itself hemmed in is the same problem one
+level down: work out what is pinning it, clear that first, come back.  A box that
+will not budge at all becomes scenery, and the target routes around it.
+
+Nothing is trusted on the way out: every single-cell move is checked against
+`Board.can_place` as the plan is built, and anything that does not survive that
+is discarded rather than returned.
+
+This is deliberately a feasibility finder, not an optimiser.  `AnytimePlanner`
+takes its plan as a starting incumbent and improves it against the real cost
+function, with a bound.  That split is the point: this answers "is there a way,
+and what is it", the optimiser answers "how good can it get".
 """
 
 from collections import deque
@@ -40,6 +49,9 @@ from astar_planner import Move, Plan
 from board import DIRECTIONS, Board
 from cost_model import CostModel
 from puzzle_state import Cell, PuzzleState
+
+# A leg of the finished plan: one box, and the cells it walks through.
+Leg = Tuple[int, List[Cell]]
 
 
 class CellMask:
@@ -59,7 +71,6 @@ class CellMask:
         return self.bits[cy * self.width + cx] != 0
 
     def merge(self, other: "CellMask"):
-        """Add another mask's blocked cells to this one."""
         bits, incoming = self.bits, other.bits
         for i, value in enumerate(incoming):
             if value:
@@ -84,7 +95,7 @@ def _bfs(box: int, start: Cell, mask: CellMask,
          accept: Callable[[Cell], bool]) -> Optional[List[Cell]]:
     """Shortest route for one box to the first cell `accept` likes.
 
-    Every step costs the same, so breadth-first already gives the shortest.
+    Every step costs the same, so breadth-first already gives the shortest one.
     Returns the cells travelled, `start` included, or None.
     """
     if mask.blocked(start):
@@ -119,14 +130,19 @@ def _bfs(box: int, start: Cell, mask: CellMask,
 
 
 class DecompositionPlanner:
-    """Feasibility first: route the target, then clear whatever is in the way."""
+    """Drive the target, clear what stops it, repeat."""
 
     def __init__(self, board: Board, cost_model: CostModel,
-                 max_reroutes: int = 8, max_clears: int = 60):
+                 max_reroutes: int = 8, max_clears: int = 120,
+                 short_horizon: int = 6):
         self.board = board
         self.cost = cost_model
         self.max_reroutes = max_reroutes
         self.max_clears = max_clears
+        # When a box cannot clear the whole remaining route, it is asked to
+        # clear only the next few cells instead — enough for the target to get
+        # past it.  If it is in the way again later, it gets shoved again.
+        self.short_horizon = short_horizon
 
     # ------------------------------------------------------------------ entry
 
@@ -138,135 +154,226 @@ class DecompositionPlanner:
         if start.cells[target] == goal:
             return Plan(True, "box is already on the goal", states=[start])
 
-        walls: Set[int] = set()          # boxes the target must route around
+        # Two strategies, and which wins is not predictable from the layout:
+        # clearing up front is cheaper when it works, because the target drives
+        # in a single leg, but the placements it commits to can box in whatever
+        # is met later.  Each takes milliseconds, so run both — separately, so
+        # that one strategy's dead end does not send the other down the wrong
+        # reroute — and keep the cheaper plan.
+        best: Optional[Plan] = None
+        for up_front in (True, False):
+            found = self._attempt(start, target, goal, up_front)
+            if found is not None and (best is None or found.cost < best.cost):
+                best = found
+        return best
+
+    def _attempt(self, start: PuzzleState, target: int, goal: Cell,
+                 up_front: bool) -> Optional[Plan]:
+        """Drive to the goal, walling off boxes that refuse to move, until it
+        works or the reroutes run out."""
+        walls: Set[int] = set()
         for _ in range(self.max_reroutes):
-            route = self._route(start, target, goal, walls)
-            if route is None:
-                return None              # not even reachable through the walls
-
-            blockers = self._blockers(start, target, route, walls)
-            if not blockers:
-                displaced: List[Tuple[int, List[Cell]]] = []
-            else:
-                displaced = self._clear(start, target, route, blockers)
-                if displaced is None:
-                    # Something in the way refuses to budge.  Treat the first
-                    # such box as scenery and find the target another way round.
-                    walls.add(blockers[0])
-                    continue
-
-            built = self._assemble(start, target, route, displaced)
-            if built is not None:
-                return built
-            walls.add(blockers[0] if blockers else target)
+            legs, stuck = self._drive(start, target, goal, walls, up_front)
+            if legs is not None:
+                built = self._assemble(start, target, legs)
+                if built is not None:
+                    return built
+            if stuck is None:
+                return None              # no route at all, or nothing to blame
+            walls.add(stuck)
         return None
 
-    # ---------------------------------------------------------------- routing
+    # ---------------------------------------------------------------- driving
 
-    def _route(self, start: PuzzleState, target: int, goal: Cell,
+    def _drive(self, start: PuzzleState, target: int, goal: Cell,
+               walls: Set[int],
+               up_front: bool) -> Tuple[Optional[List[Leg]], Optional[int]]:
+        """Walk the target to its goal, clearing whatever stops it on the way.
+
+        Returns (legs, None) on success, or (None, box to route around).
+        """
+        board = self.board
+        route = self._route(start, target, goal, walls)
+        if route is None:
+            return None, None
+
+        state = start
+        legs: List[Leg] = []
+        at = 0
+
+        # First try to clear the whole route before setting off.  When that
+        # works the target drives it in one leg — one grip instead of one per
+        # obstruction, which is much cheaper.  Boxes that will not clear that
+        # much are simply left; the loop below deals with them as it meets them,
+        # by which point the region they must vacate is far smaller.
+        if up_front:
+            for blocker in self._on_route(state, target, route):
+                cleared = self._clear(state, target, route, blocker)
+                if cleared is not None:
+                    early, state = cleared
+                    legs.extend(early)
+
+        for _ in range(self.max_clears):
+            # Drive as far as the floor allows from where we actually are.
+            ahead = at
+            while (ahead + 1 < len(route)
+                   and board.can_place(state, target, route[ahead + 1])):
+                ahead += 1
+            if ahead > at:
+                path = list(route[at:ahead + 1])
+                state = self._walk(state, target, path)
+                if state is None:
+                    return None, None
+                legs.append((target, path))
+                at = ahead
+            if at == len(route) - 1:
+                return legs, None
+
+            # Nose to nose with something.  Whatever is sitting on the next cell
+            # has to give way — but only over the route still to be driven.
+            nxt = route[at + 1]
+            blocker = next(
+                (other for other in range(board.count)
+                 if other != target
+                 and board.boxes_overlap(target, nxt, other, state.cells[other])),
+                None)
+            if blocker is None:
+                return None, None        # stopped by the arena, not a box
+
+            cleared = self._clear(state, target, route[at:], blocker)
+            if cleared is None:
+                return None, blocker
+            moved_legs, state = cleared
+            legs.extend(moved_legs)
+        return None, None
+
+    def _on_route(self, state: PuzzleState, target: int,
+                  route: Sequence[Cell]) -> List[int]:
+        """Boxes the route runs through, in the order the target meets them."""
+        board = self.board
+        met: List[int] = []
+        for cell in route:
+            for other in range(board.count):
+                if other == target or other in met:
+                    continue
+                if board.boxes_overlap(target, cell, other, state.cells[other]):
+                    met.append(other)
+        return met
+
+    def _route(self, state: PuzzleState, target: int, goal: Cell,
                walls: Set[int]) -> Optional[List[Cell]]:
         """The target's shortest route, movable boxes ignored, `walls` solid."""
         mask = CellMask(self.board, target)
         for other in walls:
-            mask.block_box(self.board, target, other, start.cells[other])
-        return _bfs(target, start.cells[target], mask, lambda cell: cell == goal)
+            mask.block_box(self.board, target, other, state.cells[other])
+        return _bfs(target, state.cells[target], mask, lambda cell: cell == goal)
 
-    def _blockers(self, start: PuzzleState, target: int, route: Sequence[Cell],
-                  walls: Set[int]) -> List[int]:
-        """Boxes the route runs through, in the order the target meets them."""
-        board = self.board
-        seen: List[int] = []
-        for cell in route:
-            for other in range(board.count):
-                if other == target or other in walls or other in seen:
-                    continue
-                if board.boxes_overlap(target, cell, other, start.cells[other]):
-                    seen.append(other)
-        return seen
+    def _walk(self, state: PuzzleState, box: int,
+              path: Sequence[Cell]) -> Optional[PuzzleState]:
+        """Apply a box's path one cell at a time, refusing anything illegal."""
+        for previous, cell in zip(path, path[1:]):
+            if not self.board.can_place(state, box, cell):
+                return None
+            state = state.with_move(box, cell[0] - previous[0],
+                                    cell[1] - previous[1])
+        return state
 
     # --------------------------------------------------------------- clearing
 
-    def _clear(self, start: PuzzleState, target: int, route: Sequence[Cell],
-               blockers: Sequence[int]):
-        """Shove everything out of the way.  Returns ordered moves, or None.
+    def _clear(self, state: PuzzleState, target: int, remaining: Sequence[Cell],
+               blocker: int) -> Optional[Tuple[List[Leg], PuzzleState]]:
+        """Get `blocker` out of the target's way, moving others if it is pinned.
 
-        Each box carries its own *keep-out* region — the cells it must not end
-        on.  A box on the target's route has to clear the target's corridor; a
-        box pinning one of those has to clear *that* box's escape route, which
-        is a different region entirely.  Getting this wrong is subtle: a box
-        already outside the target's corridor looks "done" even while it is the
-        very thing blocking its neighbour, and the chase then runs out of
-        candidates and gives up.
-
-        `where` tracks the layout as it goes, so each escape is planned against
-        the floor it will actually meet when the moves are run in this order.  A
-        box may be asked to move more than once if a later constraint arrives.
+        `remaining` is the route the target has left, starting from where it
+        stands.  The blocker is asked to clear all of it; if it cannot, it is
+        asked to clear only the next few cells, which is enough to let the
+        target past and is very often possible when the full clearance is not.
         """
         board = self.board
-        where: Dict[int, Cell] = dict(enumerate(start.cells))
-        displaced: List[Tuple[int, List[Cell]]] = []
+        legs: List[Leg] = []
         keep_out: Dict[int, CellMask] = {}
-        pending: List[int] = []
+        attempted: Dict[int, Set[int]] = {}
+        pending: List[int] = [blocker]
+
+        def corridor(box: int, cells: Sequence[Cell]) -> CellMask:
+            mask = CellMask(board, box)
+            for cell in cells:
+                mask.block_box(board, box, target, cell)
+            return mask
 
         def require(box: int, region: CellMask):
+            """Note that `box` must vacate `region`, and put it at the front.
+
+            Front matters: a box already queued further back never gets
+            reprioritised otherwise, and whatever is waiting on it re-derives
+            the same pin forever — a livelock that looks like a hopeless layout.
+            """
             existing = keep_out.get(box)
             if existing is None:
                 keep_out[box] = region
             else:
                 existing.merge(region)
-            if box not in pending:
-                pending.insert(0, box)
+            if box in pending:
+                pending.remove(box)
+            pending.insert(0, box)
 
-        for blocker in blockers:
-            corridor = CellMask(board, blocker)
-            for cell in route:
-                corridor.block_box(board, blocker, target, cell)
-            require(blocker, corridor)
+        keep_out[blocker] = corridor(blocker, remaining)
+        short = corridor(blocker, remaining[:self.short_horizon])
 
         for _ in range(self.max_clears):
             if not pending:
-                return displaced
+                return legs, state
             box = pending[0]
             if box == target:
                 pending.pop(0)
                 continue
 
-            banned = keep_out[box]
             solid = CellMask(board, box)
-            for other, cell in where.items():
+            for other, cell in enumerate(state.cells):
                 if other != box:
                     solid.block_box(board, box, other, cell)
 
-            escape = _bfs(box, where[box], solid,
-                          lambda cell: not banned.blocked(cell))
+            wanted = keep_out[box]
+            escape = _bfs(box, state.cells[box], solid,
+                          lambda cell: not wanted.blocked(cell))
+            if escape is None and box == blocker:
+                # Settle for getting out of the immediate way.
+                wanted = short
+                escape = _bfs(box, state.cells[box], solid,
+                              lambda cell: not wanted.blocked(cell))
             if escape is not None:
                 pending.pop(0)
                 if len(escape) > 1:
-                    where[box] = escape[-1]
-                    displaced.append((box, escape))
+                    walked = self._walk(state, box, escape)
+                    if walked is None:
+                        return None
+                    state = walked
+                    legs.append((box, escape))
                 continue
 
             # Hemmed in.  Work out the route it *would* have taken with the
             # other boxes gone, and make whatever sits on that route clear it.
-            through = _bfs(box, where[box], CellMask(board, box),
-                           lambda cell: not banned.blocked(cell))
+            through = _bfs(box, state.cells[box], CellMask(board, box),
+                           lambda cell: not wanted.blocked(cell))
             if through is None:
-                return None          # walled in by the arena, not by a box
+                return None              # walled in by the arena, not a box
 
-            pin = None
+            crossers: List[int] = []
             for cell in through:
-                for other, at in where.items():
-                    if other in (box, target):
+                for other, at in enumerate(state.cells):
+                    if other in (box, target) or other in crossers:
                         continue
                     if board.boxes_overlap(box, cell, other, at):
-                        pin = other
-                        break
-                if pin is not None:
-                    break
+                        crossers.append(other)
+
+            # Asking the same box again after it failed to help just spins, so
+            # work along the route to the next candidate instead.
+            already = attempted.setdefault(box, set())
+            pin = next((c for c in crossers if c not in already), None)
             if pin is None:
                 return None
+            already.add(pin)
 
-            # What the pin has to vacate is this box's route, not the target's.
             region = CellMask(board, pin)
             for cell in through:
                 region.block_box(board, pin, box, cell)
@@ -275,20 +382,14 @@ class DecompositionPlanner:
 
     # --------------------------------------------------------------- assembly
 
-    def _assemble(self, start: PuzzleState, target: int, route: Sequence[Cell],
-                  displaced: Sequence[Tuple[int, List[Cell]]]) -> Optional[Plan]:
-        """Replay as single-cell moves, checking every layout against the rules.
-
-        Nothing above is trusted: if the schedule does not survive being executed
-        in order, this returns None rather than handing back an illegal plan.
-        """
+    def _assemble(self, start: PuzzleState, target: int,
+                  legs: Sequence[Leg]) -> Optional[Plan]:
+        """Replay the legs as single-cell moves, checking every layout."""
         board = self.board
         state = start
         moves: List[Move] = []
         states: List[PuzzleState] = [start]
 
-        legs = [(box, path) for box, path in displaced]
-        legs.append((target, list(route)))
         for box, path in legs:
             for previous, cell in zip(path, path[1:]):
                 if not board.can_place(state, box, cell):
@@ -297,9 +398,6 @@ class DecompositionPlanner:
                 state = state.with_move(box, delta[0], delta[1])
                 moves.append(Move(box, delta, board.step))
                 states.append(state)
-
-        if state.cells[target] != route[-1]:
-            return None
 
         distance_by_box: Dict[int, float] = {}
         regrips = 0
@@ -313,9 +411,10 @@ class DecompositionPlanner:
                                          + move.distance)
             previous_box = move.box
 
+        shoved = len({box for box, _ in legs} - {target})
         return Plan(
             found=True,
-            message=f"feasible plan, {len(displaced)} box(es) moved aside",
+            message=f"feasible plan, {shoved} box(es) moved aside",
             moves=moves,
             states=states,
             cost=total,
