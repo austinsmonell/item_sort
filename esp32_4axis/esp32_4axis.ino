@@ -2,11 +2,25 @@
    esp32_4axis_serial.ino
    ---------------------------------------------------------------------
    ESP32-WROOM-32U  ->  3x HB808C closed-loop + 1x open-loop stepper
-   USB serial control. No WiFi, no Bluetooth, no radio brought up at all.
+   USB serial control plus WiFi, and wireless reflash over OTA.
 
-   Drive it either way:
+   Drive it any of three ways - all speak the same line protocol:
      - Arduino Serial Monitor at 115200, line ending "Newline". Type HELP.
-     - stepper_gui.html in Chrome/Edge, which talks to this over Web Serial.
+     - stepper_gui.html over Web Serial (USB cable).
+     - stepper_gui.html over WiFi, to ws://<board-ip>:81.
+
+   Output is broadcast to every connected transport, so the serial monitor
+   and the browser always see the same thing.
+
+   WIFI IS NOT AN E-STOP PATH. A dropped link cannot stop a moving machine
+   any faster than its timeout, so the board watches for that itself: if the
+   last WebSocket client goes away while an axis is moving, motion stops.
+   That is a backstop, not a safety device. Keep a hardware e-stop in the
+   motor supply.
+
+   THE -U MODULE HAS NO ANTENNA ON IT. WROOM-32U brings the RF out to a
+   U.FL connector instead of a PCB trace. Without a pigtail antenna fitted
+   it will associate from a few inches away and nowhere else.
 
    AXIS PAIRING:
      Axes 1 and 2 are two motors on opposite ends of one rail, so nothing
@@ -18,23 +32,39 @@
      Check that the two ends move the same way before homing. If they
      fight, flip one with "C 2 inv 1" rather than rewiring.
 
-   WIRING ASSUMPTION (rev 4 - no buffer chip):
-     - 5 V common anode: all PUL+ / DIR+ tied to a shared 5 V rail
-     - GPIO sinks the minus lines directly -> LOGIC IS INVERTED
-       GPIO LOW = optocoupler conducting = signal asserted
+   WIRING ASSUMPTION (rev 5 - common cathode, no buffer chip):
+     - all PUL- / DIR- tied to ground, shared with the ESP32
+     - GPIO drives the plus lines directly -> LOGIC IS NORMAL
+       GPIO HIGH = optocoupler conducting = signal asserted
      - Encoders EA+/EB+ tapped through a TXS0108E (5 V -> 3V3)
      - ALM not wired
 
+   WHY THIS IS THE RIGHT WAY ROUND. The previous rev tied the plus lines
+   to 5 V and sank the minus lines. A 3.3 V GPIO high then left 1.7 V
+   across the opto - above the LED forward voltage, so a couple of mA kept
+   flowing and a de-asserted input never actually cleared. Edge-triggered
+   PUL survived that; a level-sensitive DIR did not, which is what pinned
+   an axis to one direction. Common cathode gives a true 0 V off state.
+
+   The cost is drive current: 3.3 V into an input resistor sized for 5 V
+   is roughly 8 mA where the driver expected 14 mA. That is inside spec
+   for the usual opto inputs. If one driver is marginal, lower its series
+   resistor - do not go back to a 5 V anode.
+
    PULSE POLARITY NOTE:
-     FastAccelStepper idles its step pin LOW and pulses HIGH. With the
-     inverted hardware above the opto conducts at idle and switches off
-     during each pulse. The HB808C is edge triggered so it steps fine,
-     but the input LED runs warm at idle. To avoid that, flip the pulse
-     trigger edge in the vendor PC software.
+     FastAccelStepper idles its step pin LOW and pulses HIGH, which is now
+     exactly what the hardware wants: dark at idle, conducting during the
+     pulse. Nothing to flip in the vendor software any more, and the input
+     LEDs no longer run warm doing nothing.
 
    LIBRARIES (Library Manager):
      - FastAccelStepper   by gin66
      - ESP32Encoder       by Kevin Harrington
+     - WebSockets         by Markus Sattler   ("arduinoWebSockets")
+
+   WIFI SETUP: fill in WIFI_SSID / WIFI_PASS below. The first flash has to
+   go over USB; after that the board appears in the Arduino IDE under
+   Tools > Port as a network port and OTA_PASS unlocks it.
 
    FLASH WITH THE MOTOR SUPPLY OFF. Every upload resets the board and
    leaves the unbuffered PUL lines floating, which can emit stray steps.
@@ -43,6 +73,19 @@
 #include <FastAccelStepper.h>
 #include <ESP32Encoder.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <ArduinoOTA.h>
+#include <WebSocketsServer.h>
+
+// ---------------------------------------------------------------------
+// Network. Edit these two before the first flash.
+// ---------------------------------------------------------------------
+#define WIFI_SSID  "YFI"
+#define WIFI_PASS  "luludoges"
+#define OTA_HOST   "stepper"          // -> stepper.local, and the OTA port name
+#define OTA_PASS   "stepper-ota"      // Arduino IDE asks for this on upload
+#define WS_PORT    81
 
 // ---------------------------------------------------------------------
 // Pin map - rev 4. Do not connect GPIO12 (sets flash voltage at boot).
@@ -74,14 +117,25 @@ struct AxisConfig {
   uint32_t workOffset;      // final distance from the stop to call zero
   uint32_t maxHomeTravel;   // give up after this many steps
   uint32_t invertDir;       // 1 = flip this motor's sense (mirrored mount)
+  uint32_t homeEnable;      // 0 = refuse to home this axis at all
 };
 
 AxisConfig cfg[NUM_AXES] = {
-  // run   accel  home  slow  dir  ppr   cpr   thr  back  offs  maxtrav  inv
-  {  2000,  8000,  600,  120,  -1,  2000, 4000,  40,  400,  800, 200000,  0 },  // gantry end A
-  {  2000,  8000,  600,  120,  -1,  2000, 4000,  40,  400,  800, 200000,  0 },  // gantry end B
-  {  2000,  8000,  600,  120,  -1,  2000, 4000,  40,  400,  800, 200000,  0 },
-  {  2000,  8000,  600,  120,  -1,  1600,    0,   0,  400,  800, 200000,  0 }   // open loop
+  // run   accel  home  slow  dir  ppr   cpr   thr  back  offs  maxtrav  inv  home
+  {  2000,  8000,  600,  120,  -1,  2000, 4000,  40,  400,  800, 200000,  0,   1 },  // gantry end A
+  {  2000,  8000,  600,  120,  -1,  2000, 4000,  40,  400,  800, 200000,  0,   1 },  // gantry end B
+  {  2000,  8000,  600,  120,  -1,  2000, 4000,  40,  400,  800, 200000,  0,   1 },
+  // Open loop, NEMA 17 on a 300 mm T8x8 screw: 8 mm lead / 1600 ppr =
+  // 200 steps/mm. maxHomeTravel has to be the length of the AXIS, not a
+  // round number - with no encoder H_DEADRECKON cannot tell that it has
+  // reached the stop, so every step past the end is a stalled motor at
+  // full current. 64000 = 320 mm, just past full travel.
+  //
+  // homeEnable is 0: with no encoder the only way this axis can find a
+  // stop is to drive into it and keep pushing, which is a stalled motor at
+  // full current for however long is left in maxHomeTravel. Nothing here
+  // can detect arrival. Set a limit switch, or zero it by hand with Z 4.
+  {  2000,  8000,  600,  120,  -1,  1600,    0,   0,  400,  800,  64000,  0,   0 }
 };
 
 // ---------------------------------------------------------------------
@@ -131,6 +185,32 @@ int      homeChain   = -1;      // >=0 while HOME ALL walks the axes in turn
 bool     streaming   = true;    // periodic status lines for the GUI
 uint32_t streamMs    = 250;
 
+WebSocketsServer ws(WS_PORT);
+uint8_t  wsClients  = 0;        // counted by hand: connectedClients() still
+                                // includes the client being torn down when
+                                // the DISCONNECTED event fires
+bool     wifiUp     = false;
+
+// =====================================================================
+// Output. Every reply goes to both transports, so a command typed in the
+// serial monitor shows up in the browser and vice versa. That matters more
+// than it sounds: with two ways in, a machine that only told one of them
+// what it was doing would be worse than one with a single control path.
+// =====================================================================
+static void outLine(const char* s) {
+  Serial.println(s);
+  if (wsClients) ws.broadcastTXT(s);
+}
+
+static void outf(const char* fmt, ...) {
+  char buf[160];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  outLine(buf);
+}
+
 float countsPerStep[NUM_AXES] = { 0, 0, 0, 0 };
 
 static inline bool hasEncoder(int a) { return a < NUM_ENCODERS && cfg[a].encCountsPerRev > 0; }
@@ -147,12 +227,24 @@ static int64_t encCount(int a) {
   return encoder[a].getCount();
 }
 
-// false = direction pin INVERTED, matching common-anode wiring where a LOW
-// GPIO asserts the signal. invertDir flips it again for a motor mounted
-// mirrored to its partner - the usual case at the far end of a gantry.
+// DIR must be settled before the first pulse of a move. FastAccelStepper
+// defaults to no setup time, which the HB808C tolerates but a slower opto
+// does not: the first steps of a reversal then go out under the old
+// direction. Note the library clamps this to MIN_DIR_DELAY_US, which is
+// 200 us on esp32 - asking for less does not get you less.
+#define DIR_SETUP_US 200
+
+// Common cathode: DIR- is grounded, so the GPIO must SOURCE current to
+// light the opto and a high asserts. That makes the pins push-pull, which
+// is not a free choice - an open-drain output can only sink, so it could
+// never assert a common-cathode input at all.
+//
+// dirHighCountsUp is therefore true in the normal case, the opposite of
+// the old common-anode wiring. invertDir still flips one motor of a pair
+// that is mounted mirrored to its partner.
 static void applyDirection(int a) {
   if (!stepper[a]) return;
-  stepper[a]->setDirectionPin(DIR_PIN[a], cfg[a].invertDir != 0);
+  stepper[a]->setDirectionPin(DIR_PIN[a], cfg[a].invertDir == 0, DIR_SETUP_US);
 }
 
 static void applyAxisSpeed(int a, uint32_t speed) {
@@ -177,7 +269,7 @@ static void faultAxis(int a, const char* msg) {
   st[a].home    = H_FAULT;
   st[a].isHomed = false;
   snprintf(st[a].fault, sizeof(st[a].fault), "%s", msg);
-  Serial.printf("# axis %d FAULT: %s\n", a + 1, msg);
+  outf("# axis %d FAULT: %s", a + 1, msg);
   if (isGantry(a)) faultAxis(partnerOf(a), "partner faulted");   // recurses once
 }
 
@@ -264,7 +356,7 @@ static void serviceHoming(int a) {
         if (hasEncoder(a)) encoder[a].setCount(0);
         st[a].isHomed = true;
         st[a].home = H_DONE;
-        Serial.printf("# axis %d homed\n", a + 1);
+        outf("# axis %d homed", a + 1);
       }
       break;
 
@@ -277,7 +369,7 @@ static void serviceHoming(int a) {
         s->moveTo(-cfg[a].homeDir * (int32_t)cfg[a].workOffset);
         st[a].isHomed = true;
         st[a].home = H_DONE;
-        Serial.printf("# axis %d blind-homed (approximate)\n", a + 1);
+        outf("# axis %d blind-homed (approximate)", a + 1);
       }
       break;
 
@@ -338,7 +430,7 @@ static void zeroOne(int a) {
   st[a].isHomed  = true;
   st[a].home     = H_IDLE;
   st[a].fault[0] = '\0';
-  Serial.printf("# axis %d zeroed\n", a + 1);
+  outf("# axis %d zeroed", a + 1);
 }
 
 // Zeroing both ends where they stand keeps whatever squareness they have.
@@ -350,8 +442,23 @@ static void commandZero(int a) {
 // Both ends run their own state machine into their own hard stop at the
 // same time: that simultaneous touch is what squares the rail.
 static void commandHome(int a) {
+  if (!cfg[a].homeEnable) {
+    outf("# axis %d homing disabled - Z %d to zero it here, or C %d he 1",
+         a + 1, a + 1, a + 1);
+    return;
+  }
   beginHome(a);
   if (isGantry(a)) beginHome(partnerOf(a));
+}
+
+// Next axis at or after 'from' that is allowed to home, else NUM_AXES.
+// HOME ALL has to skip disabled axes rather than command them: the chain
+// advances on seeing H_DONE, and an axis that never started would never
+// reach it, hanging the sequence forever.
+static int nextHomingAxis(int from) {
+  for (int a = from; a < NUM_AXES; a++)
+    if (cfg[a].homeEnable) return a;
+  return NUM_AXES;
 }
 
 static bool busyHoming(int a) {
@@ -414,33 +521,37 @@ static void emitStatus() {
     j += ",\"thr\":"; j += cfg[a].stallThreshold;
     j += ",\"bo\":";  j += cfg[a].backoffSteps;
     j += ",\"wo\":";  j += cfg[a].workOffset;
+    j += ",\"mt\":";  j += cfg[a].maxHomeTravel;
     j += ",\"dir\":"; j += cfg[a].homeDir;
     j += ",\"inv\":"; j += cfg[a].invertDir;
+    j += ",\"he\":";  j += cfg[a].homeEnable;
     j += "}}";
   }
   j += "]}";
-  Serial.println(j);
+  outLine(j.c_str());
 }
 
 // =====================================================================
 // Command parser
 // =====================================================================
 static void printHelp() {
-  Serial.println(F("# commands (axis is 1-4; 1 and 2 are one gantry, always move together):"));
-  Serial.println(F("#   J <axis> <steps>     jog, negative steps reverses"));
-  Serial.println(F("#   M <axis> <pos>       move to absolute position"));
-  Serial.println(F("#   H <axis>             home one axis (1 or 2 homes both ends)"));
-  Serial.println(F("#   HA                   home all, one at a time"));
-  Serial.println(F("#   Z <axis>             set current position as zero"));
-  Serial.println(F("#   S                    stop all motion"));
-  Serial.println(F("#   E 1 | E 0            engage / release e-stop"));
-  Serial.println(F("#   C <axis> <key> <val> set config, then saved to flash"));
-  Serial.println(F("#     keys: run acc hs hss ppr cpr thr bo wo dir inv"));
-  Serial.println(F("#     run acc hs hss bo wo dir mirror across axes 1+2;"));
-  Serial.println(F("#     ppr cpr thr inv stay per motor"));
-  Serial.println(F("#   ?                    print one status line"));
-  Serial.println(F("#   V 1 | V 0            status streaming on / off"));
-  Serial.println(F("#   HELP                 this list"));
+  outLine("# commands (axis is 1-4; 1 and 2 are one gantry, always move together):");
+  outLine("#   J <axis> <steps>     jog, negative steps reverses");
+  outLine("#   M <axis> <pos>       move to absolute position");
+  outLine("#   H <axis>             home one axis (1 or 2 homes both ends)");
+  outLine("#   HA                   home all, one at a time");
+  outLine("#   Z <axis>             set current position as zero");
+  outLine("#   S                    stop all motion");
+  outLine("#   E 1 | E 0            engage / release e-stop");
+  outLine("#   C <axis> <key> <val> set config, then saved to flash");
+  outLine("#     keys: run acc hs hss ppr cpr thr bo wo mt dir inv he");
+  outLine("#     run acc hs hss bo wo mt dir he mirror across axes 1+2;");
+  outLine("#     ppr cpr thr inv stay per motor");
+  outLine("#   ?                    print one status line");
+  outLine("#   V 1 | V 0            status streaming on / off");
+  outLine("#   T <axis>             self test: report state, then step slowly");
+  outLine("#   IP                   wifi address, signal and client count");
+  outLine("#   HELP                 this list");
 }
 
 static int parseAxis(const String& tok) {
@@ -458,8 +569,10 @@ static bool applyConfigKey(int a, const String& key, long val) {
   else if (key == "thr") cfg[a].stallThreshold  = max(0L, val);
   else if (key == "bo")  cfg[a].backoffSteps    = max(0L, val);
   else if (key == "wo")  cfg[a].workOffset      = max(0L, val);
+  else if (key == "mt")  cfg[a].maxHomeTravel   = max(1L, val);
   else if (key == "dir") cfg[a].homeDir         = (val >= 0) ? 1 : -1;
   else if (key == "inv") cfg[a].invertDir       = (val != 0) ? 1 : 0;
+  else if (key == "he")  cfg[a].homeEnable      = (val != 0) ? 1 : 0;
   else return false;
 
   recomputeRatios();
@@ -474,18 +587,19 @@ static bool applyConfigKey(int a, const String& key, long val) {
 // per motor: they describe one drive's own hardware.
 static bool isSharedKey(const String& key) {
   return key == "run" || key == "acc" || key == "hs" || key == "hss" ||
-         key == "bo"  || key == "wo"  || key == "dir";
+         key == "bo"  || key == "wo"  || key == "dir" || key == "mt" ||
+         key == "he";
 }
 
 static void handleConfigCmd(int a, String key, long val) {
   key.toLowerCase();
-  if (!applyConfigKey(a, key, val)) { Serial.printf("# unknown key '%s'\n", key.c_str()); return; }
-  Serial.printf("# axis %d %s = %ld (saved)\n", a + 1, key.c_str(), val);
+  if (!applyConfigKey(a, key, val)) { outf("# unknown key '%s'", key.c_str()); return; }
+  outf("# axis %d %s = %ld (saved)", a + 1, key.c_str(), val);
 
   if (isGantry(a) && isSharedKey(key)) {
     int p = partnerOf(a);
     applyConfigKey(p, key, val);
-    Serial.printf("# axis %d %s = %ld (saved, gantry pair)\n", p + 1, key.c_str(), val);
+    outf("# axis %d %s = %ld (saved, gantry pair)", p + 1, key.c_str(), val);
   }
 }
 
@@ -512,37 +626,46 @@ static void execLine(String line) {
 
   if (cmd == "?") { emitStatus(); return; }
 
-  if (cmd == "V") { streaming = (n > 1 && tok[1].toInt() != 0);
-                    Serial.printf("# streaming %s\n", streaming ? "on" : "off"); return; }
+  if (cmd == "IP") {
+    if (!wifiUp) { outLine("# wifi down - serial only"); return; }
+    outf("# %s  ip %s  rssi %d dBm  ws clients %u",
+         OTA_HOST, WiFi.localIP().toString().c_str(), WiFi.RSSI(), wsClients);
+    return;
+  }
 
-  if (cmd == "S") { stopAll(); Serial.println(F("# stopped")); return; }
+  if (cmd == "V") { streaming = (n > 1 && tok[1].toInt() != 0);
+                    outf("# streaming %s", streaming ? "on" : "off"); return; }
+
+  if (cmd == "S") { stopAll(); outLine("# stopped"); return; }
 
   if (cmd == "E") {
     bool set = (n > 1) ? (tok[1].toInt() != 0) : true;
     estopActive = set;
     if (set) stopAll();
-    Serial.printf("# e-stop %s\n", set ? "ENGAGED" : "released");
+    outf("# e-stop %s", set ? "ENGAGED" : "released");
     return;
   }
 
   if (cmd == "HA") {
-    if (estopActive) { Serial.println(F("# blocked: e-stop engaged")); return; }
-    homeChain = 0;
-    commandHome(0);
-    Serial.println(F("# homing all axes in sequence"));
+    if (estopActive) { outLine("# blocked: e-stop engaged"); return; }
+    int first = nextHomingAxis(0);
+    if (first >= NUM_AXES) { outLine("# no axis has homing enabled"); return; }
+    homeChain = first;
+    commandHome(first);
+    outLine("# homing all enabled axes in sequence");
     return;
   }
 
   // everything below needs an axis argument
-  if (n < 2) { Serial.println(F("# missing axis")); return; }
+  if (n < 2) { outLine("# missing axis"); return; }
   int a = parseAxis(tok[1]);
-  if (a < 0) { Serial.println(F("# axis must be 1-4")); return; }
+  if (a < 0) { outLine("# axis must be 1-4"); return; }
 
   if (cmd == "H") {
-    if (estopActive) { Serial.println(F("# blocked: e-stop engaged")); return; }
+    if (estopActive) { outLine("# blocked: e-stop engaged"); return; }
     commandHome(a);
-    if (isGantry(a)) Serial.printf("# homing gantry pair (axes %d+%d)\n", GANTRY_A + 1, GANTRY_B + 1);
-    else             Serial.printf("# homing axis %d\n", a + 1);
+    if (isGantry(a)) outf("# homing gantry pair (axes %d+%d)", GANTRY_A + 1, GANTRY_B + 1);
+    else             outf("# homing axis %d", a + 1);
     return;
   }
 
@@ -551,22 +674,166 @@ static void execLine(String line) {
     return;
   }
 
+  // Answers the only question that matters when an axis is dead: is the
+  // board failing to command it, or is it commanding fine and nothing
+  // downstream is listening? Steps slowly enough to be unmistakable and
+  // reports the position it actually reached.
+  if (cmd == "T") {
+    outf("# axis %d: pul=%u dir=%u  stepper=%s",
+         a + 1, PUL_PIN[a], DIR_PIN[a], stepper[a] ? "attached" : "NULL (attach failed at boot)");
+    outf("# axis %d: estop=%d state=%s busy=%d homed=%d",
+         a + 1, estopActive ? 1 : 0, HOME_STATE_NAME[st[a].home],
+         busyHoming(a) ? 1 : 0, st[a].isHomed ? 1 : 0);
+    outf("# axis %d: run=%u acc=%u ppr=%u inv=%u he=%u",
+         a + 1, cfg[a].runSpeed, cfg[a].accel, cfg[a].pulsesPerRev,
+         cfg[a].invertDir, cfg[a].homeEnable);
+    if (!stepper[a]) { outf("# axis %d: cannot test, no stepper", a + 1); return; }
+    if (estopActive) { outf("# axis %d: cannot test, e-stop engaged", a + 1); return; }
+
+    // 200 steps at 200 Hz is one full second of stepping - slow enough to
+    // watch the shaft and to meter the pulse line by hand.
+    int32_t p0 = stepper[a]->getCurrentPosition();
+    stepper[a]->setSpeedInHz(200);
+    stepper[a]->setAcceleration(1000);
+    stepper[a]->move(200);
+    uint32_t t0 = millis();
+    while (stepper[a]->isRunning() && millis() - t0 < 4000) {
+      if (wifiUp) ws.loop();     // keep the heartbeat alive across the wait
+      delay(10);
+    }
+    int32_t p1 = stepper[a]->getCurrentPosition();
+    applyAxisSpeed(a, cfg[a].runSpeed);        // put the working speed back
+
+    outf("# axis %d: commanded 200, position moved %ld in %lu ms",
+         a + 1, (long)(p1 - p0), (unsigned long)(millis() - t0));
+    if (p1 - p0 == 0)
+      outf("# axis %d: engine issued nothing - firmware side", a + 1);
+    else
+      outf("# axis %d: pulses were generated - if the shaft did not turn, "
+           "the fault is the driver or the wiring", a + 1);
+    return;
+  }
+
   if (cmd == "J" || cmd == "M") {
-    if (estopActive) { Serial.println(F("# blocked: e-stop engaged")); return; }
+    if (estopActive) { outLine("# blocked: e-stop engaged"); return; }
     if (!stepper[a]) return;
-    if (busyHoming(a)) { Serial.printf("# axis %d busy homing\n", a + 1); return; }
-    if (n < 3) { Serial.println(F("# missing distance")); return; }
+    if (busyHoming(a)) { outf("# axis %d busy homing", a + 1); return; }
+    if (n < 3) { outLine("# missing distance"); return; }
     commandMove(a, tok[2].toInt(), cmd == "M");
     return;
   }
 
   if (cmd == "C") {
-    if (n < 4) { Serial.println(F("# usage: C <axis> <key> <value>")); return; }
+    if (n < 4) { outLine("# usage: C <axis> <key> <value>"); return; }
     handleConfigCmd(a, tok[2], tok[3].toInt());
     return;
   }
 
-  Serial.printf("# unknown command '%s' - try HELP\n", cmd.c_str());
+  outf("# unknown command '%s' - try HELP", cmd.c_str());
+}
+
+// =====================================================================
+// Network
+// =====================================================================
+static bool anyMoving() {
+  for (int a = 0; a < NUM_AXES; a++)
+    if (stepper[a] && stepper[a]->isRunning()) return true;
+  return false;
+}
+
+// A WebSocket frame is one command line, byte for byte what the serial
+// monitor would take. Keeping one parser for both transports is the whole
+// reason the protocol is line based.
+static void onWsEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t len) {
+  switch (type) {
+
+    case WStype_CONNECTED: {
+      wsClients++;
+      IPAddress ip = ws.remoteIP(num);
+      outf("# ws client %u connected from %s", num, ip.toString().c_str());
+      emitStatus();                         // new client should not wait for the tick
+      break;
+    }
+
+    case WStype_DISCONNECTED:
+      if (wsClients) wsClients--;
+      Serial.printf("# ws client %u disconnected\n", num);
+      // Last one out while the machine is moving: the operator has lost
+      // sight of it and can no longer press stop, so stop for them. The
+      // heartbeat below is what makes this fire on a dead link and not
+      // just on a clean browser close.
+      if (wsClients == 0 && anyMoving()) {
+        stopAll();
+        outLine("# link lost with motion in progress - stopped");
+      }
+      break;
+
+    case WStype_TEXT: {
+      String line;
+      line.reserve(len + 1);
+      for (size_t i = 0; i < len; i++) line += (char)payload[i];
+      execLine(line);
+      break;
+    }
+
+    default: break;
+  }
+}
+
+static void setupNetwork() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);          // modem sleep adds ~100 ms of jitter to jogs
+  WiFi.setAutoReconnect(true);
+  WiFi.setHostname(OTA_HOST);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.print("# wifi connecting");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  // Not fatal. USB serial still drives the machine, so come up either way
+  // rather than sitting in a retry loop with the motors unattended.
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("# wifi FAILED - serial control only");
+    return;
+  }
+
+  wifiUp = true;
+  Serial.printf("# wifi %s  ip %s  rssi %d\n",
+                WIFI_SSID, WiFi.localIP().toString().c_str(), WiFi.RSSI());
+
+  if (MDNS.begin(OTA_HOST)) {
+    MDNS.addService("ws", "tcp", WS_PORT);
+    Serial.printf("# mdns %s.local\n", OTA_HOST);
+  }
+
+  ws.begin();
+  ws.onEvent(onWsEvent);
+  // Ping every 2 s, expect a pong inside 1 s, give up after 2 misses. This
+  // is what turns a yanked power lead or a dead AP into a DISCONNECTED
+  // event in ~5 s instead of hanging a half-open socket indefinitely.
+  ws.enableHeartbeat(2000, 1000, 2);
+  Serial.printf("# websocket on ws://%s:%d\n", WiFi.localIP().toString().c_str(), WS_PORT);
+
+  ArduinoOTA.setHostname(OTA_HOST);
+  ArduinoOTA.setPassword(OTA_PASS);
+  ArduinoOTA.onStart([]() {
+    // The board reboots at the end of this, so stop the motors while the
+    // sketch still can: an axis left running would keep its last commanded
+    // direction with nothing servicing the step line. E-stop is engaged to
+    // block anything arriving during the transfer, not to persist - the
+    // reboot clears it, and it clears isHomed with it. Re-home after OTA.
+    stopAll();
+    estopActive = true;
+    Serial.println("# OTA starting - motion stopped, re-home after reboot");
+  });
+  ArduinoOTA.onError([](ota_error_t e) { Serial.printf("# OTA error %u\n", e); });
+  ArduinoOTA.begin();
+  Serial.printf("# OTA ready as '%s'\n", OTA_HOST);
 }
 
 // =====================================================================
@@ -582,7 +849,7 @@ void setup() {
   engine.init();
   for (int a = 0; a < NUM_AXES; a++) {
     stepper[a] = engine.stepperConnectToPin(PUL_PIN[a]);
-    if (!stepper[a]) { Serial.printf("# axis %d: step pin %u failed\n", a + 1, PUL_PIN[a]); continue; }
+    if (!stepper[a]) { outf("# axis %d: step pin %u failed", a + 1, PUL_PIN[a]); continue; }
     applyDirection(a);
     stepper[a]->setSpeedInHz(cfg[a].runSpeed);
     stepper[a]->setAcceleration(cfg[a].accel);
@@ -597,11 +864,22 @@ void setup() {
     encoder[e].setCount(0);
   }
 
-  Serial.println(F("# 4-axis stepper controller ready (serial only, no radio)"));
+  setupNetwork();
+
+  outLine("# 4-axis stepper controller ready");
   printHelp();
 }
 
 void loop() {
+  // --- network --------------------------------------------------------
+  // Both are cheap when idle and neither blocks, so they run every pass
+  // rather than on a timer: a stop command arriving over WiFi should not
+  // wait behind anything.
+  if (wifiUp) {
+    ws.loop();
+    ArduinoOTA.handle();
+  }
+
   // --- serial input ---------------------------------------------------
   static String buf;
   while (Serial.available()) {
@@ -628,12 +906,12 @@ void loop() {
       bool bad  = st[a].home == H_FAULT || (pair && st[partnerOf(a)].home == H_FAULT);
       bool done = st[a].home == H_DONE  && (!pair || st[partnerOf(a)].home == H_DONE);
       if (bad) {
-        Serial.printf("# home-all aborted at axis %d\n", a + 1);
+        outf("# home-all aborted at axis %d", a + 1);
         homeChain = -1;
       } else if (done) {
-        int next = pair ? afterGantry() : a + 1;
+        int next = nextHomingAxis(pair ? afterGantry() : a + 1);
         if (next < NUM_AXES) { homeChain = next; commandHome(next); }
-        else { Serial.println(F("# home-all complete")); homeChain = -1; }
+        else { outLine("# home-all complete"); homeChain = -1; }
       }
     }
   }

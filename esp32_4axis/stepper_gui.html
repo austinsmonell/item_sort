@@ -22,6 +22,9 @@
   button.wide{width:100%}
   .estop{background:var(--bad);border-color:#8f3330;font-weight:700;letter-spacing:.5px}
   .estop.armed{background:#4a2220;color:#ffb4b0}
+  .host{background:#14171c;color:var(--ink);border:1px solid var(--line);
+        border-radius:4px;padding:5px 7px;font:inherit;font-size:12px;width:130px}
+  .link{font-size:10px;color:var(--dim);letter-spacing:.5px;margin-right:4px}
   .go{background:#243a4d;border-color:#2f5570}
   .conn{background:#1d3a2e;border-color:#2c5a45}
   .dot{width:9px;height:9px;border-radius:50%;background:#555;display:inline-block}
@@ -45,6 +48,12 @@
   .val.m{font-size:16px}
   .sub{font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
   .jog{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}
+  /* keyboard jog lights the button it stands in for, so the operator can
+     see which axis just took the command without looking at the log */
+  .jog button.key{background:var(--accent);border-color:var(--accent);color:#08121b}
+  .keys{font-size:10px;color:var(--dim);letter-spacing:.5px;text-align:center;
+        margin:-4px 0 8px}
+  .keys b{color:var(--ink);font-weight:600}
   .steps{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px}
   .steps button{padding:7px 0;font-size:12px}
   .steps button.sel{background:var(--accent);border-color:var(--accent);color:#08121b;font-weight:700}
@@ -65,6 +74,10 @@
   .banner{background:#4a2220;color:#ffb4b0;padding:9px 14px;font-size:12px;display:none}
   .banner.on{display:block}
   .note{background:#2a2f38;color:var(--dim);padding:12px 14px;font-size:12px;line-height:1.6}
+  .cmdbar{display:flex;gap:8px;margin:0 14px 8px}
+  .cmdbar input{flex:1;background:#0f1115;color:var(--ink);border:1px solid var(--line);
+        border-radius:6px;padding:9px 11px;font:inherit;font-size:12px}
+  .cmdbar input:focus{outline:none;border-color:var(--accent)}
   #log{margin:0 14px 20px;background:#0f1115;border:1px solid var(--line);border-radius:6px;
        padding:10px;height:150px;overflow:auto;font-size:11px;color:var(--dim);white-space:pre-wrap}
 </style></head><body>
@@ -72,8 +85,11 @@
 <header>
   <h1>4-AXIS STEPPER CONTROL</h1>
   <span class="dot" id="dot"></span>
+  <span class="link" id="link"></span>
   <span class="spacer"></span>
-  <button class="conn" id="btnConn" onclick="connect()">CONNECT</button>
+  <input id="host" class="host" placeholder="stepper.local" title="board hostname or IP">
+  <button class="conn" id="btnWifi" onclick="connectWifi()">WIFI</button>
+  <button class="conn" id="btnConn" onclick="connect()">USB</button>
   <button class="go" onclick="send('HA')">HOME ALL</button>
   <button onclick="send('S')">STOP</button>
   <button id="es" class="estop" onclick="toggleEstop()">E-STOP</button>
@@ -82,7 +98,10 @@
 <div id="banner" class="banner">E-STOP ENGAGED &mdash; all motion blocked. Press E-STOP again to release.</div>
 
 <div class="note" id="note">
-  Chrome or Edge on desktop required (Web Serial). Serve this file over
+  <b>WIFI</b> &mdash; type the board's hostname or IP in the box and press WIFI.
+  The firmware prints both on boot, and <code>IP</code> reprints them.
+  <br>
+  <b>USB</b> &mdash; Chrome or Edge on desktop (Web Serial). Serve this file over
   <b>http://localhost</b> &mdash; from the folder, run <code>python -m http.server 8000</code>
   and open <code>http://localhost:8000/stepper_gui.html</code>. Opening it directly
   as a file:// URL will not be allowed to reach the serial port.
@@ -90,6 +109,12 @@
 </div>
 
 <div class="wrap" id="axes"></div>
+
+<div class="cmdbar">
+  <input id="cmd" spellcheck="false" autocomplete="off"
+         placeholder="command, e.g. T 4 &mdash; Enter to send, Up/Down for history">
+  <button onclick="sendCmd()">SEND</button>
+</div>
 <div id="log"></div>
 
 <script>
@@ -101,22 +126,34 @@ const ENC = 3;               // axes 1-3 are closed loop, axis 4 is not
 // here to move one end without the other. The firmware enforces the same
 // pairing, so the Serial Monitor cannot split them either.
 const CARDS = [
-  { name:'AXIS 1 + 2', tag:'GANTRY PAIR', tagcls:'gan', motors:[0,1], cmd:1 },
-  { name:'AXIS 3',     tag:'HB808C',      tagcls:'',    motors:[2],   cmd:3 },
-  { name:'AXIS 4',     tag:'OPEN LOOP',   tagcls:'ol',  motors:[3],   cmd:4 }
+  { name:'AXIS 1 + 2', tag:'GANTRY PAIR', tagcls:'gan', motors:[0,1], cmd:1,
+    keys:['ArrowDown','ArrowUp'],     keyLabel:'&#8593; &#8595;' },
+  { name:'AXIS 3',     tag:'HB808C',      tagcls:'',    motors:[2],   cmd:3,
+    keys:['ArrowLeft','ArrowRight'],  keyLabel:'&#8592; &#8594;' },
+  { name:'AXIS 4',     tag:'OPEN LOOP',   tagcls:'ol',  motors:[3],   cmd:4,
+    keys:['PageDown','PageUp'],       keyLabel:'PgDn PgUp' }
 ];
+
+// key name -> [card, direction]. Built from CARDS so the two never drift.
+const KEYJOG = {};
+CARDS.forEach((c,ci)=>{ KEYJOG[c.keys[0]] = [ci,-1]; KEYJOG[c.keys[1]] = [ci,1]; });
 
 // run/acc/hs/hss/bo/wo/dir mirror across the pair in firmware, so the card
 // shows them once. ppr/cpr/thr/inv describe one drive and stay per motor.
 const SHARED   = [['run','run speed (st/s)'],['acc','accel (st/s&sup2;)'],
                   ['hs','home speed'],['hss','precise speed'],
-                  ['bo','backoff (steps)'],['wo','work offset']];
+                  ['bo','backoff (steps)'],['wo','work offset'],
+                  ['mt','max home travel']];
 const PERMOTOR = [['ppr','pulses / rev'],['cpr','enc counts / rev'],['thr','stall thresh (cnt)']];
 
 const hasEnc = a => a < ENC;
 let sel = CARDS.map(()=>200);
 let esOn = false;
-let port = null, writer = null, connected = false;
+// One command path at a time. USB and WiFi reach the same parser on the
+// board, so opening the second closes the first: two operators on two
+// links with no sight of each other is a bad way to run a machine.
+let port = null, writer = null, sock = null;
+let link = null;             // null | 'usb' | 'wifi'
 let cfgLoaded = false;
 
 function el(h){const d=document.createElement('div');d.innerHTML=h.trim();return d.firstChild;}
@@ -184,11 +221,12 @@ function build(){
           </div>
 
           <div class="jog">
-            <button onclick="jog(${ci},-1)">&#9664; JOG &minus;</button>
-            <button onclick="jog(${ci},1)">JOG &#9654;</button>
+            <button id="j${ci}_-1" onclick="jog(${ci},-1)">&#9664; JOG &minus;</button>
+            <button id="j${ci}_1" onclick="jog(${ci},1)">JOG &#9654;</button>
           </div>
+          <div class="keys"><b>${c.keyLabel}</b></div>
           <div class="jog">
-            <button class="go" onclick="send('H ${c.cmd}')">${multi?'HOME PAIR':'HOME'}</button>
+            <button class="go" id="hb${ci}" onclick="send('H ${c.cmd}')">${multi?'HOME PAIR':'HOME'}</button>
             <button onclick="send('Z ${c.cmd}')">SET ZERO</button>
           </div>
           ${multi?`<div class="hint">both ends driven together &mdash; homing drives each
@@ -200,6 +238,10 @@ function build(){
               <div><label>home direction${multi?' (both)':''}</label>
                 <select id="k${ci}_dir">
                   <option value="-1">negative</option><option value="1">positive</option>
+                </select></div>
+              <div><label>homing</label>
+                <select id="k${ci}_he">
+                  <option value="0">disabled</option><option value="1">enabled</option>
                 </select></div>
             </div>
             ${c.motors.map(a=>`
@@ -225,12 +267,67 @@ function pick(ci,v,btn){
 }
 
 async function send(line){
-  if(!writer){ log('! not connected'); return; }
-  await writer.write(new TextEncoder().encode(line + "\n"));
+  if(link === 'usb' && writer){
+    await writer.write(new TextEncoder().encode(line + "\n"));
+  } else if(link === 'wifi' && sock && sock.readyState === WebSocket.OPEN){
+    sock.send(line);          // one frame is one command line
+  } else {
+    log('! not connected');
+  }
 }
 
 function jog(ci,d){ send(`J ${CARDS[ci].cmd} ${d*sel[ci]}`); }
+
+// Keyboard jog. One press = one jog of the selected step size, exactly what
+// the button does. Auto-repeat is dropped on purpose: J is relative and the
+// firmware adds it to the move already in flight, so a held key would stack
+// tens of moves a second into a run the operator never asked for.
+function keyJog(ci,d){
+  jog(ci,d);
+  const b = document.getElementById(`j${ci}_${d}`);
+  if(!b) return;
+  b.classList.add('key');
+  setTimeout(()=>b.classList.remove('key'), 130);
+}
+
+document.addEventListener('keydown', e=>{
+  if(e.repeat || e.ctrlKey || e.altKey || e.metaKey) return;
+  const m = KEYJOG[e.key];
+  if(!m) return;
+  // never steal the arrows from a number field or a select in settings
+  if(e.target.closest('input, select, textarea')) return;
+  e.preventDefault();          // stop the page scrolling under the operator
+  keyJog(m[0], m[1]);
+});
 function toggleEstop(){ send(esOn ? 'E 0' : 'E 1'); }
+
+// Raw command entry. The board takes the same line protocol on both
+// transports, so this is the Serial Monitor equivalent for a WiFi link -
+// the Arduino IDE's monitor cannot attach to a network port at all.
+let cmdHist = [], cmdAt = 0;
+
+function sendCmd(){
+  const box = document.getElementById('cmd');
+  const line = box.value.trim();
+  if(!line) return;
+  log('> ' + line);              // echo, so the log reads as a transcript
+  send(line);
+  if(cmdHist[cmdHist.length-1] !== line) cmdHist.push(line);
+  cmdAt = cmdHist.length;
+  box.value = '';
+}
+
+document.getElementById('cmd').addEventListener('keydown', e=>{
+  if(e.key === 'Enter'){ e.preventDefault(); sendCmd(); return; }
+  // the jog handler ignores keys typed into an input, so the arrows are
+  // free here for history
+  if(e.key === 'ArrowUp'   && cmdAt > 0){
+    e.preventDefault(); cmdAt--; e.target.value = cmdHist[cmdAt] || '';
+  }
+  if(e.key === 'ArrowDown' && cmdAt < cmdHist.length){
+    e.preventDefault(); cmdAt++; e.target.value = cmdHist[cmdAt] || '';
+  }
+});
 
 function saveCfg(ci){
   const c = CARDS[ci];
@@ -241,32 +338,51 @@ function saveCfg(ci){
   // shared keys go out once; the firmware mirrors them onto the partner
   SHARED.forEach(([k])=> put(c.cmd,k,`k${ci}_${k}`));
   put(c.cmd,'dir',`k${ci}_dir`);
+  put(c.cmd,'he',`k${ci}_he`);
   c.motors.forEach(a=>{
     PERMOTOR.forEach(([k])=> put(a+1,k,`c${a}_${k}`));
     put(a+1,'inv',`c${a}_inv`);
   });
 }
 
+// Both transports deliver the same thing: '{' lines are status JSON, the
+// rest is human-readable output from the board. Parsing lives here once.
+function handleLine(line){
+  line = line.trim();
+  if(!line) return;
+  if(line[0] === '{'){ try{ apply(JSON.parse(line)); }catch(e){} }
+  else log(line);
+}
+
+function setLink(kind, label){
+  link = kind;
+  document.getElementById('dot').className = 'dot' + (kind ? ' on' : '');
+  document.getElementById('link').textContent = label || '';
+  document.getElementById('btnConn').textContent = kind === 'usb'  ? 'DROP USB'  : 'USB';
+  document.getElementById('btnWifi').textContent = kind === 'wifi' ? 'DROP WIFI' : 'WIFI';
+  if(kind) document.getElementById('note').style.display = 'none';
+}
+
+async function dropLink(){
+  if(sock){ const t = sock; sock = null; try{ t.close(); }catch(e){} }
+  if(writer){ try{ await writer.close(); }catch(e){} writer = null; }
+  if(port){ try{ await port.close(); }catch(e){} port = null; }
+  setLink(null);
+}
+
+// ---------------------------------------------------------------- USB
 async function connect(){
-  if(connected){
-    try{ await writer.close(); await port.close(); }catch(e){}
-    connected=false; writer=null; port=null;
-    document.getElementById('dot').className='dot';
-    document.getElementById('btnConn').textContent='CONNECT';
-    return;
-  }
+  if(link === 'usb'){ await dropLink(); log('# usb closed'); return; }
   if(!('serial' in navigator)){ log('! Web Serial unavailable - use Chrome or Edge over http://localhost'); return; }
+  await dropLink();
   try{
     port = await navigator.serial.requestPort();
     await port.open({ baudRate: 115200 });
     writer = port.writable.getWriter();
-    connected = true;
-    document.getElementById('dot').className='dot on';
-    document.getElementById('btnConn').textContent='DISCONNECT';
-    document.getElementById('note').style.display='none';
+    setLink('usb','USB 115200');
     readLoop();
-    log('# connected');
-  }catch(e){ log('! '+e.message); }
+    log('# connected over usb');
+  }catch(e){ log('! '+e.message); port=null; writer=null; setLink(null); }
 }
 
 async function readLoop(){
@@ -281,17 +397,38 @@ async function readLoop(){
     buf += r.value;
     let i;
     while((i = buf.indexOf("\n")) >= 0){
-      const line = buf.slice(0,i).trim();
+      handleLine(buf.slice(0,i));
       buf = buf.slice(i+1);
-      if(!line) continue;
-      if(line[0] === '{'){ try{ apply(JSON.parse(line)); }catch(e){} }
-      else log(line);
     }
   }
-  connected=false;
-  document.getElementById('dot').className='dot';
-  document.getElementById('btnConn').textContent='CONNECT';
-  log('# disconnected');
+  if(link === 'usb') setLink(null);
+  log('# usb disconnected');
+}
+
+// ---------------------------------------------------------------- WiFi
+function connectWifi(){
+  if(link === 'wifi'){ dropLink(); log('# wifi closed'); return; }
+  const box = document.getElementById('host');
+  const host = (box.value || box.placeholder).trim();
+  if(!host){ log('! enter the board hostname or IP'); return; }
+  localStorage.setItem('stepperHost', host);
+  dropLink();
+
+  const url = `ws://${host}:81`;
+  log('# connecting to ' + url);
+  let s;
+  try{ s = new WebSocket(url); }catch(e){ log('! '+e.message); return; }
+  sock = s;
+
+  s.onopen    = ()=>{ if(sock===s){ setLink('wifi', host); log('# connected over wifi'); } };
+  s.onmessage = ev=>{ String(ev.data).split("\n").forEach(handleLine); };
+  s.onerror   = ()=>{ log('! websocket error - check the address, and that the board has an antenna fitted'); };
+  s.onclose   = ()=>{
+    if(sock !== s) return;      // superseded by a newer link; stale event
+    sock = null;
+    setLink(null);
+    log('# wifi disconnected');
+  };
 }
 
 function stateClass(s,moving){
@@ -337,11 +474,22 @@ function apply(d){
     const chip = document.getElementById('sc'+ci);
     chip.textContent = s.state;
     chip.className = stateClass(s.state,s.moving);
+    const first = d.axis[c.motors[0]];
+
+    // An axis with homing off should not offer the button at all - a
+    // disabled open-loop axis homes by grinding into a stop.
+    const hb = document.getElementById('hb'+ci);
+    if(hb){
+      const on = first.c.he !== 0;
+      hb.disabled = !on;
+      hb.textContent = on ? (c.motors.length>1 ? 'HOME PAIR' : 'HOME') : 'HOMING OFF';
+    }
+
     if(!cfgLoaded){
-      const first = d.axis[c.motors[0]];
       const set=(id,v)=>{const e=document.getElementById(id); if(e) e.value=v;};
       SHARED.forEach(([k])=> set(`k${ci}_${k}`, first.c[k]));
       set(`k${ci}_dir`, first.c.dir);
+      set(`k${ci}_he`, first.c.he === undefined ? 1 : first.c.he);
     }
   });
 
@@ -354,4 +502,6 @@ function apply(d){
 }
 
 build();
+document.getElementById('host').value = localStorage.getItem('stepperHost') || '';
+setLink(null);
 </script></body></html>
