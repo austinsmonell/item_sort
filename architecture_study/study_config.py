@@ -20,6 +20,13 @@ BOX_TYPES = (
 )
 
 DEFAULT_COUNTS = {"small": 4, "medium": 3, "large": 2}
+
+# The gripper: two L-shaped jaws that close on opposite corners of a box.  The
+# jaws sit outside the box, so a box needs empty floor at its corners before it
+# can be picked up at all — layouts are generated with that clearance in mind.
+GRIPPER_THICKNESS = 0.01   # how thick each arm of the L is
+GRIPPER_REACH = 0.05       # how far each arm runs along the edge from the corner
+GRIPPER_STROKE = 0.02      # how far the travelling jaw backs off to open
 MAX_COUNT_PER_TYPE = 40
 
 # Random placement tries this many cells per box before giving up and reporting

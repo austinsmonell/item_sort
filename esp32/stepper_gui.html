@@ -1,0 +1,357 @@
+<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>4-Axis Stepper Control</title>
+<style>
+  :root{
+    --bg:#14161a; --panel:#1d2026; --line:#2c313a; --ink:#e8eaed;
+    --dim:#8a919d; --accent:#4a9eda; --ok:#3fa87a; --bad:#d9534f;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
+  header{position:sticky;top:0;z-index:10;background:var(--panel);
+         border-bottom:2px solid var(--line);padding:10px 14px;
+         display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  h1{font-size:15px;margin:0;font-weight:700;letter-spacing:.4px}
+  .spacer{flex:1}
+  button{font:inherit;color:var(--ink);background:#272b33;border:1px solid var(--line);
+         border-radius:5px;padding:9px 13px;cursor:pointer;-webkit-tap-highlight-color:transparent}
+  button:active{background:#333944}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.wide{width:100%}
+  .estop{background:var(--bad);border-color:#8f3330;font-weight:700;letter-spacing:.5px}
+  .estop.armed{background:#4a2220;color:#ffb4b0}
+  .go{background:#243a4d;border-color:#2f5570}
+  .conn{background:#1d3a2e;border-color:#2c5a45}
+  .dot{width:9px;height:9px;border-radius:50%;background:#555;display:inline-block}
+  .dot.on{background:var(--ok)}
+  .wrap{padding:14px;display:grid;gap:14px;
+        grid-template-columns:repeat(auto-fill,minmax(330px,1fr))}
+  .axis{background:var(--panel);border:1px solid var(--line);border-radius:7px;overflow:hidden}
+  .axis h2{margin:0;padding:9px 12px;font-size:13px;background:#232730;
+           border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
+  .tag{font-size:10px;padding:2px 7px;border-radius:3px;background:#2f3540;color:var(--dim)}
+  .tag.ol{background:#3d2a22;color:#e0a080}
+  .tag.gan{background:#22323d;color:#8fc4ee}
+  .body{padding:12px}
+  /* one label, one cell per motor, one unit: a paired axis reads as two
+     columns of the same quantity rather than two separate axis cards */
+  .mrow{display:grid;grid-template-columns:70px repeat(var(--n),1fr) auto;
+        gap:8px;align-items:center;margin-bottom:9px}
+  .lbl{color:var(--dim);min-width:70px;font-size:12px}
+  .mh{font-size:10px;color:var(--dim);letter-spacing:.5px}
+  .val{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}
+  .val.m{font-size:16px}
+  .sub{font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
+  .jog{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0}
+  .steps{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px}
+  .steps button{padding:7px 0;font-size:12px}
+  .steps button.sel{background:var(--accent);border-color:var(--accent);color:#08121b;font-weight:700}
+  .state{font-size:11px;padding:3px 8px;border-radius:3px;background:#2a2f38;color:var(--dim);
+         text-align:center}
+  .state.homed{background:#1d3a2e;color:#7fd3ab}
+  .state.busy{background:#2c3a4a;color:#8fc4ee}
+  .state.fault{background:#3d2222;color:#ee9a96}
+  .hint{font-size:11px;color:var(--dim);margin:-2px 0 4px}
+  details{border-top:1px solid var(--line);margin-top:10px;padding-top:9px}
+  summary{cursor:pointer;color:var(--dim);font-size:12px;outline:none}
+  .mtitle{font-size:11px;color:var(--dim);letter-spacing:.5px;margin:12px 0 4px;
+          border-top:1px dashed var(--line);padding-top:9px}
+  .cfg{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:9px}
+  .cfg label{font-size:11px;color:var(--dim);display:block}
+  .cfg input,.cfg select{width:100%;background:#14171c;color:var(--ink);
+        border:1px solid var(--line);border-radius:4px;padding:5px;font:inherit;font-size:12px}
+  .banner{background:#4a2220;color:#ffb4b0;padding:9px 14px;font-size:12px;display:none}
+  .banner.on{display:block}
+  .note{background:#2a2f38;color:var(--dim);padding:12px 14px;font-size:12px;line-height:1.6}
+  #log{margin:0 14px 20px;background:#0f1115;border:1px solid var(--line);border-radius:6px;
+       padding:10px;height:150px;overflow:auto;font-size:11px;color:var(--dim);white-space:pre-wrap}
+</style></head><body>
+
+<header>
+  <h1>4-AXIS STEPPER CONTROL</h1>
+  <span class="dot" id="dot"></span>
+  <span class="spacer"></span>
+  <button class="conn" id="btnConn" onclick="connect()">CONNECT</button>
+  <button class="go" onclick="send('HA')">HOME ALL</button>
+  <button onclick="send('S')">STOP</button>
+  <button id="es" class="estop" onclick="toggleEstop()">E-STOP</button>
+</header>
+
+<div id="banner" class="banner">E-STOP ENGAGED &mdash; all motion blocked. Press E-STOP again to release.</div>
+
+<div class="note" id="note">
+  Chrome or Edge on desktop required (Web Serial). Serve this file over
+  <b>http://localhost</b> &mdash; from the folder, run <code>python -m http.server 8000</code>
+  and open <code>http://localhost:8000/stepper_gui.html</code>. Opening it directly
+  as a file:// URL will not be allowed to reach the serial port.
+  Close the Arduino Serial Monitor first, or the port will be busy.
+</div>
+
+<div class="wrap" id="axes"></div>
+<div id="log"></div>
+
+<script>
+const N = 4;                 // firmware axes
+const ENC = 3;               // axes 1-3 are closed loop, axis 4 is not
+
+// Axes 1 and 2 are two motors on opposite ends of one rail. They get a
+// single card with a single set of controls: there is deliberately no way
+// here to move one end without the other. The firmware enforces the same
+// pairing, so the Serial Monitor cannot split them either.
+const CARDS = [
+  { name:'AXIS 1 + 2', tag:'GANTRY PAIR', tagcls:'gan', motors:[0,1], cmd:1 },
+  { name:'AXIS 3',     tag:'HB808C',      tagcls:'',    motors:[2],   cmd:3 },
+  { name:'AXIS 4',     tag:'OPEN LOOP',   tagcls:'ol',  motors:[3],   cmd:4 }
+];
+
+// run/acc/hs/hss/bo/wo/dir mirror across the pair in firmware, so the card
+// shows them once. ppr/cpr/thr/inv describe one drive and stay per motor.
+const SHARED   = [['run','run speed (st/s)'],['acc','accel (st/s&sup2;)'],
+                  ['hs','home speed'],['hss','precise speed'],
+                  ['bo','backoff (steps)'],['wo','work offset']];
+const PERMOTOR = [['ppr','pulses / rev'],['cpr','enc counts / rev'],['thr','stall thresh (cnt)']];
+
+const hasEnc = a => a < ENC;
+let sel = CARDS.map(()=>200);
+let esOn = false;
+let port = null, writer = null, connected = false;
+let cfgLoaded = false;
+
+function el(h){const d=document.createElement('div');d.innerHTML=h.trim();return d.firstChild;}
+function txt(id,v){const e=document.getElementById(id); if(e) e.textContent=v;}
+function log(s){
+  const l=document.getElementById('log');
+  l.textContent += s + "\n";
+  if(l.textContent.length > 8000) l.textContent = l.textContent.slice(-6000);
+  l.scrollTop = l.scrollHeight;
+}
+
+function metricRow(c,label,prefix,unit,deadText){
+  const cells = c.motors.map(a=>{
+    const dead = deadText && !hasEnc(a);
+    return `<span class="${dead?'sub':'val'+(c.motors.length>1?' m':'')}" id="${prefix}${a}">`
+         + `${dead?deadText:'0'}</span>`;
+  }).join('');
+  return `<div class="mrow" style="--n:${c.motors.length}">
+            <span class="lbl">${label}</span>${cells}<span class="sub">${unit}</span></div>`;
+}
+
+function cfgFields(list,idPrefix,disabled){
+  return list.map(([k,label])=>
+    `<div><label>${label}</label>
+       <input id="${idPrefix}${k}" type="number" ${disabled&&k!=='ppr'?'disabled':''}></div>`).join('');
+}
+
+function build(){
+  const wrap = document.getElementById('axes');
+  CARDS.forEach((c,ci)=>{
+    const multi = c.motors.length > 1;
+    const heads = multi
+      ? `<div class="mrow" style="--n:2"><span class="lbl"></span>
+           ${c.motors.map(a=>`<span class="mh">MOTOR ${a+1}</span>`).join('')}<span></span></div>`
+      : '';
+    const states = multi
+      ? `<div class="mrow" style="--n:2"><span class="lbl">state</span>
+           ${c.motors.map(a=>`<span class="state" id="ms${a}">--</span>`).join('')}<span></span></div>`
+      : '';
+    const skew = multi
+      ? `<div class="mrow" style="--n:1"><span class="lbl">skew</span>
+           <span class="sub" id="skew">0</span>
+           <span class="sub">counts (M${c.motors[0]+1}&minus;M${c.motors[1]+1})</span></div>`
+      : '';
+
+    wrap.appendChild(el(`
+      <div class="axis">
+        <h2>${c.name}
+          <span class="tag ${c.tagcls}">${c.tag}</span>
+          <span style="flex:1"></span>
+          <span class="state" id="sc${ci}">--</span>
+        </h2>
+        <div class="body">
+          ${heads}
+          ${metricRow(c,'position','p','steps','')}
+          ${metricRow(c,'encoder','e','counts','no feedback')}
+          ${metricRow(c,'error','f','counts','&mdash;')}
+          ${skew}
+          ${states}
+
+          <div class="steps" id="st${ci}">
+            ${[10,100,200,1000].map(v=>
+              `<button onclick="pick(${ci},${v},this)" class="${v===200?'sel':''}">${v}</button>`
+            ).join('')}
+          </div>
+
+          <div class="jog">
+            <button onclick="jog(${ci},-1)">&#9664; JOG &minus;</button>
+            <button onclick="jog(${ci},1)">JOG &#9654;</button>
+          </div>
+          <div class="jog">
+            <button class="go" onclick="send('H ${c.cmd}')">${multi?'HOME PAIR':'HOME'}</button>
+            <button onclick="send('Z ${c.cmd}')">SET ZERO</button>
+          </div>
+          ${multi?`<div class="hint">both ends driven together &mdash; homing drives each
+                   into its own stop, which squares the rail</div>`:''}
+
+          <details><summary>settings</summary>
+            <div class="cfg">
+              ${cfgFields(SHARED,`k${ci}_`,false)}
+              <div><label>home direction${multi?' (both)':''}</label>
+                <select id="k${ci}_dir">
+                  <option value="-1">negative</option><option value="1">positive</option>
+                </select></div>
+            </div>
+            ${c.motors.map(a=>`
+              ${multi?`<div class="mtitle">MOTOR ${a+1}</div>`:''}
+              <div class="cfg">
+                ${cfgFields(PERMOTOR,`c${a}_`,!hasEnc(a))}
+                <div><label>direction sense</label>
+                  <select id="c${a}_inv">
+                    <option value="0">normal</option><option value="1">inverted</option>
+                  </select></div>
+              </div>`).join('')}
+            <button class="wide" style="margin-top:9px" onclick="saveCfg(${ci})">APPLY</button>
+          </details>
+        </div>
+      </div>`));
+  });
+}
+
+function pick(ci,v,btn){
+  sel[ci]=v;
+  document.querySelectorAll('#st'+ci+' button').forEach(b=>b.classList.remove('sel'));
+  btn.classList.add('sel');
+}
+
+async function send(line){
+  if(!writer){ log('! not connected'); return; }
+  await writer.write(new TextEncoder().encode(line + "\n"));
+}
+
+function jog(ci,d){ send(`J ${CARDS[ci].cmd} ${d*sel[ci]}`); }
+function toggleEstop(){ send(esOn ? 'E 0' : 'E 1'); }
+
+function saveCfg(ci){
+  const c = CARDS[ci];
+  const put = (axis,key,id)=>{
+    const e = document.getElementById(id);
+    if(e && !e.disabled && e.value !== '') send(`C ${axis} ${key} ${e.value}`);
+  };
+  // shared keys go out once; the firmware mirrors them onto the partner
+  SHARED.forEach(([k])=> put(c.cmd,k,`k${ci}_${k}`));
+  put(c.cmd,'dir',`k${ci}_dir`);
+  c.motors.forEach(a=>{
+    PERMOTOR.forEach(([k])=> put(a+1,k,`c${a}_${k}`));
+    put(a+1,'inv',`c${a}_inv`);
+  });
+}
+
+async function connect(){
+  if(connected){
+    try{ await writer.close(); await port.close(); }catch(e){}
+    connected=false; writer=null; port=null;
+    document.getElementById('dot').className='dot';
+    document.getElementById('btnConn').textContent='CONNECT';
+    return;
+  }
+  if(!('serial' in navigator)){ log('! Web Serial unavailable - use Chrome or Edge over http://localhost'); return; }
+  try{
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    writer = port.writable.getWriter();
+    connected = true;
+    document.getElementById('dot').className='dot on';
+    document.getElementById('btnConn').textContent='DISCONNECT';
+    document.getElementById('note').style.display='none';
+    readLoop();
+    log('# connected');
+  }catch(e){ log('! '+e.message); }
+}
+
+async function readLoop(){
+  const dec = new TextDecoderStream();
+  port.readable.pipeTo(dec.writable).catch(()=>{});
+  const reader = dec.readable.getReader();
+  let buf = '';
+  while(true){
+    let r;
+    try{ r = await reader.read(); }catch(e){ break; }
+    if(r.done) break;
+    buf += r.value;
+    let i;
+    while((i = buf.indexOf("\n")) >= 0){
+      const line = buf.slice(0,i).trim();
+      buf = buf.slice(i+1);
+      if(!line) continue;
+      if(line[0] === '{'){ try{ apply(JSON.parse(line)); }catch(e){} }
+      else log(line);
+    }
+  }
+  connected=false;
+  document.getElementById('dot').className='dot';
+  document.getElementById('btnConn').textContent='CONNECT';
+  log('# disconnected');
+}
+
+function stateClass(s,moving){
+  return 'state'+(s==='homed'?' homed' : s==='FAULT'?' fault'
+               : (moving||s!=='idle')?' busy' : '');
+}
+
+// One chip for the whole card: a fault on either end is the pair's state,
+// and anything mid-home outranks idle.
+function cardState(list){
+  if(list.some(x=>x.state==='FAULT')) return {state:'FAULT',moving:false};
+  const busy = list.find(x=>x.state!=='idle' && x.state!=='homed');
+  if(busy) return busy;
+  if(list.every(x=>x.state==='homed')) return {state:'homed',moving:list.some(x=>x.moving)};
+  return {state:'idle',moving:list.some(x=>x.moving)};
+}
+
+function apply(d){
+  esOn = d.estop;
+  document.getElementById('banner').className = 'banner'+(esOn?' on':'');
+  document.getElementById('es').className = 'estop'+(esOn?' armed':'');
+
+  for(let a=0;a<N;a++){
+    const x = d.axis[a];
+    txt('p'+a, x.pos);
+    if(hasEnc(a)){
+      txt('e'+a, x.enc);
+      txt('f'+a, x.err.toFixed(1));
+    }
+    const ms = document.getElementById('ms'+a);
+    if(ms){ ms.textContent = x.state; ms.className = stateClass(x.state,x.moving); }
+
+    if(!cfgLoaded){
+      const set=(id,v)=>{const e=document.getElementById(id); if(e) e.value=v;};
+      PERMOTOR.forEach(([k])=> set(`c${a}_${k}`, x.c[k]));
+      set(`c${a}_inv`, x.c.inv === undefined ? 0 : x.c.inv);
+    }
+  }
+
+  CARDS.forEach((c,ci)=>{
+    const list = c.motors.map(a=>d.axis[a]);
+    const s = cardState(list);
+    const chip = document.getElementById('sc'+ci);
+    chip.textContent = s.state;
+    chip.className = stateClass(s.state,s.moving);
+    if(!cfgLoaded){
+      const first = d.axis[c.motors[0]];
+      const set=(id,v)=>{const e=document.getElementById(id); if(e) e.value=v;};
+      SHARED.forEach(([k])=> set(`k${ci}_${k}`, first.c[k]));
+      set(`k${ci}_dir`, first.c.dir);
+    }
+  });
+
+  // Racking shows up here first: the two ends are commanded identically,
+  // so any difference is one end losing to the other.
+  const g = CARDS[0].motors;
+  txt('skew', d.axis[g[0]].enc - d.axis[g[1]].enc);
+
+  cfgLoaded = true;
+}
+
+build();
+</script></body></html>

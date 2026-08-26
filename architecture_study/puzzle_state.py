@@ -22,10 +22,15 @@ class PuzzleState(NamedTuple):
 
     cells: Tuple[Cell, ...]
     last_moved: int = -1  # -1 = nothing has been moved yet
+    # Which pair of corners the jaws are closed on, or -1 for nothing held.
+    # Part of the state because the gripper cannot swap diagonals without
+    # letting go, so what is legal next depends on how the box is being held.
+    held: int = -1
 
-    def with_move(self, box: int, dx: int, dy: int) -> "PuzzleState":
+    def with_move(self, box: int, dx: int, dy: int,
+                  held: int = -1) -> "PuzzleState":
         """Return a new state with `box` shifted by one grid step."""
         cells = list(self.cells)
         cx, cy = cells[box]
         cells[box] = (cx + dx, cy + dy)
-        return PuzzleState(tuple(cells), box)
+        return PuzzleState(tuple(cells), box, held)

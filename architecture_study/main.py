@@ -12,20 +12,23 @@ import sys
 import study_config as cfg
 from board import Board
 from cost_model import CostModel
+from gripper import Gripper
 from layout import LayoutFull, LayoutGenerator
 from puzzle_gui import PuzzleGUI
 
 
 def main():
+    gripper = Gripper(cfg.GRIPPER_THICKNESS, cfg.GRIPPER_REACH,
+                      cfg.GRIPPER_STROKE)
     generator = LayoutGenerator(cfg.ARENA, cfg.BOX_TYPES, cfg.PLACEMENT_ATTEMPTS,
-                                cfg.RANDOM_SEED)
+                                cfg.RANDOM_SEED, gripper=gripper)
     try:
         boxes = generator.generate(cfg.DEFAULT_COUNTS, cfg.GRID_STEP)
     except LayoutFull as exc:
         print(f"cannot build the starting layout: {exc}", file=sys.stderr)
         return 1
 
-    board = Board(cfg.ARENA, boxes, cfg.GRID_STEP)
+    board = Board(cfg.ARENA, boxes, cfg.GRID_STEP, gripper=gripper)
     cost = CostModel(cfg.DISTANCE_WEIGHT, cfg.REGRIP_WEIGHT, cfg.HEURISTIC_WEIGHT)
     PuzzleGUI(cfg, board, cost, generator).run()
     return 0

@@ -74,16 +74,19 @@ def replay(board: Board, cost: CostModel, start: PuzzleState, target: int,
 
     for box, path in legs:
         for previous, cell in zip(path, path[1:]):
-            if cell != previous and not board.can_place(state, box, cell):
-                return None
             delta = (cell[0] - previous[0], cell[1] - previous[1])
-            if delta == (0, 0):
-                continue
-            if abs(delta[0]) + abs(delta[1]) != 1:
+            if delta != (0, 0) and abs(delta[0]) + abs(delta[1]) != 1:
                 return None
-            state = state.with_move(box, delta[0], delta[1])
-            moves.append(Move(box, delta, board.step))
-            states.append(state)
+        walked = board.carry_path(state, box, path)
+        if walked is None:
+            return None
+        for previous, nxt in zip(walked, walked[1:]):
+            before = previous.cells[box]
+            after = nxt.cells[box]
+            moves.append(Move(box, (after[0] - before[0], after[1] - before[1]),
+                              board.step))
+            states.append(nxt)
+        state = walked[-1]
 
     if state.cells[target] != goal:
         return None
@@ -267,11 +270,8 @@ class PlanRepairer:
         """The layout just before leg `index` runs."""
         state = start
         for box, path in legs[:index]:
-            for previous, cell in zip(path, path[1:]):
-                delta = (cell[0] - previous[0], cell[1] - previous[1])
-                if delta == (0, 0):
-                    continue
-                if not self.board.can_place(state, box, cell):
-                    return None
-                state = state.with_move(box, delta[0], delta[1])
+            walked = self.board.carry_path(state, box, path)
+            if walked is None:
+                return None
+            state = walked[-1]
         return state

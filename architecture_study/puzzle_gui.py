@@ -253,6 +253,7 @@ class PuzzleGUI:
         self._draw_path()
         self._draw_goal()
         self._draw_boxes()
+        self._draw_gripper()
         self._draw_drag_block()
 
     def _draw_grid(self):
@@ -293,6 +294,52 @@ class PuzzleGUI:
             x1, y1 = self._px(rect.x2, rect.y)
             self.canvas.create_rectangle(x0, y0, x1, y1, outline=SELECT_EDGE,
                                          width=2, dash=(3, 3))
+
+    def _draw_gripper(self):
+        """Draw the jaws — on the box being carried, or on the selected one.
+
+        Mid-plan the jaws are wherever the machine actually is: clamped to the
+        box that just moved, on the diagonal the plan recorded. Standing still,
+        they preview the grip the selected box would get, red if neither
+        diagonal is free and that box cannot be picked up at all.
+        """
+        gripper = self.board.gripper
+        if gripper is None:
+            return
+        rects = self.board.rects(self.state)
+        carried = self.state.last_moved
+
+        if self.frame > 0 and 0 <= carried < self.board.count \
+                and self.state.held >= 0:
+            self._paint_jaws(gripper, rects[carried], self.state.held,
+                             SELECT_EDGE, reserved=True)
+            return
+
+        if self.selected is None or self.frame != 0:
+            return
+        held = rects[self.selected]
+        others = [r for i, r in enumerate(rects) if i != self.selected]
+        diagonal = gripper.usable_diagonal(held, others, self.board.arena)
+        self._paint_jaws(gripper, held, 0 if diagonal is None else diagonal,
+                         ILLEGAL_EDGE if diagonal is None else "#2b3038")
+
+    def _paint_jaws(self, gripper, rect, diagonal, colour, reserved=False):
+        """The closed jaws solid; optionally the open ones as an outline.
+
+        The outline is the room the plan actually reserved — the jaws have to be
+        able to open again to let go, so that, not the closed shape, is what had
+        to stay clear of everything.
+        """
+        if reserved:
+            for arm in gripper.open_jaws(rect, diagonal):
+                x0, y0 = self._px(arm.x, arm.y + arm.h)
+                x1, y1 = self._px(arm.x + arm.w, arm.y)
+                self.canvas.create_rectangle(x0, y0, x1, y1, outline=PATH_LINE)
+        for arm in gripper.jaws(rect, diagonal):
+            x0, y0 = self._px(arm.x, arm.y + arm.h)
+            x1, y1 = self._px(arm.x + arm.w, arm.y)
+            self.canvas.create_rectangle(x0, y0, x1, y1, fill=colour,
+                                         outline=colour)
 
     def _draw_goal(self):
         if self.goal is None or self.selected is None:
@@ -475,7 +522,8 @@ class PuzzleGUI:
         step = float(self.s_grid.get())
         try:
             boxes = self.generator.generate(counts, step)
-            board = Board(self.cfg.ARENA, boxes, step)
+            board = Board(self.cfg.ARENA, boxes, step,
+                          gripper=self.board.gripper)
         except (LayoutFull, InvalidLayout) as exc:
             self._warn(str(exc))
             return
@@ -487,7 +535,8 @@ class PuzzleGUI:
         if self._busy():
             self._warn("cancel the search before clearing the floor")
             return
-        board = Board(self.cfg.ARENA, [], float(self.s_grid.get()))
+        board = Board(self.cfg.ARENA, [], float(self.s_grid.get()),
+                      gripper=self.board.gripper)
         self._adopt(board, "floor cleared — set the counts and regenerate to "
                            "put boxes back")
 
@@ -502,7 +551,8 @@ class PuzzleGUI:
         spec = [(self.board.names[i], rect.x, rect.y, rect.w, rect.h)
                 for i, rect in enumerate(self.board.rects(self.state))]
         try:
-            board = Board(self.cfg.ARENA, spec, step)
+            board = Board(self.cfg.ARENA, spec, step,
+                          gripper=self.board.gripper)
         except InvalidLayout:
             self._warn(f"grid step {step:.2f} m rejected — boxes would overlap "
                        "once snapped to it; try a finer step, or regenerate the "

@@ -42,6 +42,7 @@ function, with a bound.  That split is the point: this answers "is there a way,
 and what is it", the optimiser answers "how good can it get".
 """
 
+import math
 from collections import deque
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -76,9 +77,19 @@ class CellMask:
             if value:
                 bits[i] = 1
 
-    def block_box(self, board: Board, box: int, other: int, cell: Cell):
-        """Block every position of `box` that would overlap `other` at `cell`."""
+    def block_box(self, board: Board, box: int, other: int, cell: Cell,
+                  pad: int = 0):
+        """Block every position of `box` that would overlap `other` at `cell`.
+
+        `pad` widens the shadow by a few cells, which is how the jaws are
+        accounted for while routing: the mask cannot know which diagonal will be
+        used, so it keeps a margin wide enough for the jaws whichever way round
+        they go.  Routing on an unpadded mask produces routes that then fail the
+        real check in `Board.carry_path`, and the whole plan gets thrown away.
+        """
         lo_x, hi_x, lo_y, hi_y = board.overlap_range(box, other, cell)
+        lo_x, hi_x = lo_x - pad, hi_x + pad
+        lo_y, hi_y = lo_y - pad, hi_y + pad
         lo_x = max(lo_x, 0)
         hi_x = min(hi_x, self.max_x)
         lo_y = max(lo_y, 0)
@@ -139,6 +150,11 @@ class DecompositionPlanner:
         self.cost = cost_model
         self.max_reroutes = max_reroutes
         self.max_clears = max_clears
+        # Cells of margin the routing masks keep for the jaws.  Rounded up, so
+        # a route the mask allows is one the real gripper check will accept.
+        gripper = getattr(board, "gripper", None)
+        self.pad = 0 if gripper is None else max(
+            1, int(math.ceil((gripper.thickness + gripper.stroke) / board.step)))
         # When a box cannot clear the whole remaining route, it is asked to
         # clear only the next few cells instead — enough for the target to get
         # past it.  If it is in the way again later, it gets shoved again.
@@ -265,18 +281,14 @@ class DecompositionPlanner:
         """The target's shortest route, movable boxes ignored, `walls` solid."""
         mask = CellMask(self.board, target)
         for other in walls:
-            mask.block_box(self.board, target, other, state.cells[other])
+            mask.block_box(self.board, target, other, state.cells[other], self.pad)
         return _bfs(target, state.cells[target], mask, lambda cell: cell == goal)
 
     def _walk(self, state: PuzzleState, box: int,
               path: Sequence[Cell]) -> Optional[PuzzleState]:
-        """Apply a box's path one cell at a time, refusing anything illegal."""
-        for previous, cell in zip(path, path[1:]):
-            if not self.board.can_place(state, box, cell):
-                return None
-            state = state.with_move(box, cell[0] - previous[0],
-                                    cell[1] - previous[1])
-        return state
+        """Carry a box along a path in one grip, refusing anything illegal."""
+        walked = self.board.carry_path(state, box, path)
+        return None if walked is None else walked[-1]
 
     # --------------------------------------------------------------- clearing
 
@@ -298,7 +310,7 @@ class DecompositionPlanner:
         def corridor(box: int, cells: Sequence[Cell]) -> CellMask:
             mask = CellMask(board, box)
             for cell in cells:
-                mask.block_box(board, box, target, cell)
+                mask.block_box(board, box, target, cell, self.pad)
             return mask
 
         def require(box: int, region: CellMask):
@@ -331,7 +343,7 @@ class DecompositionPlanner:
             solid = CellMask(board, box)
             for other, cell in enumerate(state.cells):
                 if other != box:
-                    solid.block_box(board, box, other, cell)
+                    solid.block_box(board, box, other, cell, self.pad)
 
             wanted = keep_out[box]
             escape = _bfs(box, state.cells[box], solid,
@@ -376,7 +388,7 @@ class DecompositionPlanner:
 
             region = CellMask(board, pin)
             for cell in through:
-                region.block_box(board, pin, box, cell)
+                region.block_box(board, pin, box, cell, self.pad)
             require(pin, region)
         return None
 
@@ -391,13 +403,16 @@ class DecompositionPlanner:
         states: List[PuzzleState] = [start]
 
         for box, path in legs:
-            for previous, cell in zip(path, path[1:]):
-                if not board.can_place(state, box, cell):
-                    return None
-                delta = (cell[0] - previous[0], cell[1] - previous[1])
-                state = state.with_move(box, delta[0], delta[1])
-                moves.append(Move(box, delta, board.step))
-                states.append(state)
+            walked = board.carry_path(state, box, path)
+            if walked is None:
+                return None
+            for previous, nxt in zip(walked, walked[1:]):
+                before = previous.cells[box]
+                after = nxt.cells[box]
+                moves.append(Move(box, (after[0] - before[0],
+                                        after[1] - before[1]), board.step))
+                states.append(nxt)
+            state = walked[-1]
 
         distance_by_box: Dict[int, float] = {}
         regrips = 0

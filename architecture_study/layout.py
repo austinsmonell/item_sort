@@ -27,17 +27,41 @@ class LayoutGenerator:
     """Turns per-type box counts into a random, legal starting layout."""
 
     def __init__(self, arena: Rect, types: Sequence[Tuple[str, float]],
-                 attempts: int = 500, seed=None):
-        """`types` is a sequence of (type name, side length) in metres."""
+                 attempts: int = 500, seed=None, gripper=None):
+        """`types` is a sequence of (type name, side length) in metres.
+
+        With a `gripper`, every box is placed so the jaws can actually reach it
+        — there is no point generating a layout containing boxes the machine
+        could never pick up.  Without one, placements only have to not overlap.
+        """
         self.arena = arena
         self.types = list(types)
         self.attempts = attempts
         self.rng = random.Random(seed)
+        self.gripper = gripper
 
     def fill_fraction(self, counts: Dict[str, int]) -> float:
         """Share of the arena floor the requested boxes would cover."""
         area = sum(counts.get(name, 0) * size * size for name, size in self.types)
         return area / (self.arena.w * self.arena.h)
+
+    def _grippable(self, candidate: Rect, placed: Sequence[Rect]) -> bool:
+        """Can the jaws reach the new box — and everything already down?
+
+        The second half matters as much as the first: dropping a box next to one
+        already placed can take away the last diagonal that one had, leaving a
+        box on the floor that nothing can ever pick up.
+        """
+        if self.gripper is None:
+            return True
+        if not self.gripper.can_grip(candidate, placed, self.arena):
+            return False
+        for index, existing in enumerate(placed):
+            others = [r for i, r in enumerate(placed) if i != index]
+            others.append(candidate)
+            if not self.gripper.can_grip(existing, others, self.arena):
+                return False
+        return True
 
     def generate(self, counts: Dict[str, int], step: float) -> List[tuple]:
         """Return (name, x, y, w, h) placements on a `step` grid.
@@ -73,9 +97,12 @@ class LayoutGenerator:
                 candidate = Rect(self.arena.x + self.rng.randint(0, max_x) * step,
                                  self.arena.y + self.rng.randint(0, max_y) * step,
                                  size, size)
-                if not any(candidate.overlaps(other) for other in placed):
-                    rect = candidate
-                    break
+                if any(candidate.overlaps(other) for other in placed):
+                    continue
+                if not self._grippable(candidate, placed):
+                    continue
+                rect = candidate
+                break
             if rect is None:
                 raise LayoutFull(
                     f"placed only {len(boxes)} of {len(wanted)} boxes after "

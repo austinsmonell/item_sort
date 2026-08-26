@@ -34,13 +34,22 @@ class InvalidLayout(ValueError):
 class Board:
     """Arena, box sizes and the grid that box corners are allowed to sit on."""
 
-    def __init__(self, arena: Rect, boxes: Sequence[tuple], step: float):
-        """`boxes` is a sequence of (name, x, y, w, h) in metres."""
+    def __init__(self, arena: Rect, boxes: Sequence[tuple], step: float,
+                 gripper=None):
+        """`boxes` is a sequence of (name, x, y, w, h) in metres.
+
+        With a `gripper`, a move is legal only if the mechanism can actually
+        make it: the jaws travel with the box and must clear everything else,
+        and they must be able to open where the box is picked up and set down.
+        Without one, a move only has to keep the box inside the arena and off
+        the other boxes — the idealised model the study started from.
+        """
         if step <= 0.0:
             raise InvalidLayout("grid step must be positive")
 
         self.arena = arena
         self.step = step
+        self.gripper = gripper
         self.names: List[str] = [b[0] for b in boxes]
         self.sizes: List[Tuple[float, float]] = [(b[3], b[4]) for b in boxes]
 
@@ -153,6 +162,65 @@ class Board:
                 return False
         return True
 
+    def can_carry(self, state: PuzzleState, box: int, cell: Cell,
+                  diagonal: int) -> bool:
+        """True when the *gripped* box may occupy `cell`, jaws and all.
+
+        The jaws move with the box, so the body that has to fit is the box plus
+        its open jaws — which is why a carried box cannot always follow a gap
+        the bare box would slide through.
+        """
+        if not self.can_place(state, box, cell):
+            return False
+        if self.gripper is None:
+            return True
+        held = self.rect(box, cell)
+        others = [self.rect(j, c) for j, c in enumerate(state.cells) if j != box]
+        for part in self.gripper.open_jaws(held, diagonal):
+            if not self.arena.contains(part):
+                return False
+            for other in others:
+                if part.overlaps(other):
+                    return False
+        return True
+
+    def carry_options(self, state: PuzzleState, box: int, cell: Cell,
+                      current: int) -> Tuple[int, ...]:
+        """Which diagonals could hold `box` at `cell`.
+
+        A box already in the jaws keeps the diagonal it is held on — the
+        mechanism would have to put it down to change grip.  A box being picked
+        up may be taken either way round.
+        """
+        if self.gripper is None:
+            return (-1,)
+        wanted = (current,) if current >= 0 else (0, 1)
+        return tuple(d for d in wanted if self.can_carry(state, box, cell, d))
+
+    def carry_path(self, state: PuzzleState, box: int,
+                   path: Sequence[Cell]):
+        """Walk `box` along `path` in one grip, or return None.
+
+        One grip means one diagonal for the whole leg, so the diagonal is chosen
+        once and has to survive every step of it.  Returns the states passed
+        through, the first being `state` itself.
+        """
+        options = (0, 1) if self.gripper is not None else (-1,)
+        for diagonal in options:
+            walked: List[PuzzleState] = [state]
+            current = state
+            for previous, cell in zip(path, path[1:]):
+                if cell == previous:
+                    continue
+                if not self.can_carry(current, box, cell, diagonal):
+                    break
+                current = current.with_move(box, cell[0] - previous[0],
+                                            cell[1] - previous[1], diagonal)
+                walked.append(current)
+            else:
+                return walked
+        return None
+
     def is_valid(self, state: PuzzleState) -> bool:
         return all(self.can_place(state,i, c) for i, c in enumerate(state.cells))
 
@@ -161,10 +229,16 @@ class Board:
         step = self.step
         for box in range(self.count):
             cx, cy = state.cells[box]
+            # Keeping hold of the same box keeps the same grip; taking a new one
+            # is a fresh pick, and either diagonal is available for it.
+            holding = state.held if box == state.last_moved else -1
             for dx, dy in DIRECTIONS:
                 cell = (cx + dx, cy + dy)
-                if self.can_place(state,box, cell):
-                    yield state.with_move(box, dx, dy), box, (dx, dy), step
+                if not self.can_place(state, box, cell):
+                    continue
+                for diagonal in self.carry_options(state, box, cell, holding):
+                    yield (state.with_move(box, dx, dy, diagonal), box,
+                           (dx, dy), step)
 
     def _verify_cspace(self):
         """Assert the integer overlap ranges agree with the float geometry.
