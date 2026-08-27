@@ -27,6 +27,9 @@
   .link{font-size:10px;color:var(--dim);letter-spacing:.5px;margin-right:4px}
   .go{background:#243a4d;border-color:#2f5570}
   .conn{background:#1d3a2e;border-color:#2c5a45}
+  .drv.off{background:#4a2220;border-color:#8f3330;color:#ffb4b0}
+  .num{background:#14171c;color:var(--ink);border:1px solid var(--line);
+       border-radius:4px;padding:5px 7px;font:inherit;font-size:12px;width:64px}
   .dot{width:9px;height:9px;border-radius:50%;background:#555;display:inline-block}
   .dot.on{background:var(--ok)}
   .wrap{padding:14px;display:grid;gap:14px;
@@ -54,6 +57,10 @@
   .keys{font-size:10px;color:var(--dim);letter-spacing:.5px;text-align:center;
         margin:-4px 0 8px}
   .keys b{color:var(--ink);font-weight:600}
+  .goto{display:flex;gap:8px;margin:10px 0}
+  .goto input{flex:1;min-width:0;background:#14171c;color:var(--ink);
+              border:1px solid var(--line);border-radius:5px;padding:9px 10px;font:inherit}
+  .goto input:focus{outline:none;border-color:var(--accent)}
   .steps{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px}
   .steps button{padding:7px 0;font-size:12px}
   .steps button.sel{background:var(--accent);border-color:var(--accent);color:#08121b;font-weight:700}
@@ -74,6 +81,8 @@
   .banner{background:#4a2220;color:#ffb4b0;padding:9px 14px;font-size:12px;display:none}
   .banner.on{display:block}
   .note{background:#2a2f38;color:var(--dim);padding:12px 14px;font-size:12px;line-height:1.6}
+  .cfgbar{display:flex;gap:8px;align-items:center;margin:0 14px 10px;flex-wrap:wrap}
+  .cfgbar .tag{letter-spacing:.5px}
   .cmdbar{display:flex;gap:8px;margin:0 14px 8px}
   .cmdbar input{flex:1;background:#0f1115;color:var(--ink);border:1px solid var(--line);
         border-radius:6px;padding:9px 11px;font:inherit;font-size:12px}
@@ -90,6 +99,7 @@
   <input id="host" class="host" placeholder="stepper.local" title="board hostname or IP">
   <button class="conn" id="btnWifi" onclick="connectWifi()">WIFI</button>
   <button class="conn" id="btnConn" onclick="connect()">USB</button>
+  <button class="go drv" id="drv" onclick="toggleDrives()">DRIVES</button>
   <button class="go" onclick="send('HA')">HOME ALL</button>
   <button onclick="send('S')">STOP</button>
   <button id="es" class="estop" onclick="toggleEstop()">E-STOP</button>
@@ -109,6 +119,20 @@
 </div>
 
 <div class="wrap" id="axes"></div>
+
+<div class="cfgbar">
+  <span class="tag">CONFIG BACKUP</span>
+  <button onclick="saveCfgFile()">SAVE TO FILE</button>
+  <button onclick="document.getElementById('cfgFile').click()">LOAD FROM FILE</button>
+  <input type="file" id="cfgFile" accept=".json,application/json" hidden
+         onchange="loadCfgFile(this)">
+  <span class="spacer"></span>
+  <span class="tag">IDLE DISABLE</span>
+  <input id="idleMin" class="num" type="number" min="0" step="0.5"
+         title="minutes with no movement before the drives are released; 0 = never">
+  <span class="tag">MIN</span>
+  <button onclick="applyIdle()">SET</button>
+</div>
 
 <div class="cmdbar">
   <input id="cmd" spellcheck="false" autocomplete="off"
@@ -143,10 +167,33 @@ CARDS.forEach((c,ci)=>{ KEYJOG[c.keys[0]] = [ci,-1]; KEYJOG[c.keys[1]] = [ci,1];
 const SHARED   = [['run','run speed (st/s)'],['acc','accel (st/s&sup2;)'],
                   ['hs','home speed'],['hss','precise speed'],
                   ['bo','backoff (steps)'],['wo','work offset'],
-                  ['mt','max home travel']];
+                  ['mt','max home travel'],
+                  ['spm','steps / metre'],
+                  ['lmin','min travel (cm)'],['lmax','max travel (cm)']];
 const PERMOTOR = [['ppr','pulses / rev'],['cpr','enc counts / rev'],['thr','stall thresh (cnt)']];
 
+// The operator works in different units from the wire for some keys: the
+// firmware holds travel limits in whole millimetres, the panel asks for
+// centimetres to one decimal. One table drives both directions so the read
+// and the write cannot drift apart.
+const SCALE = { lmin:10, lmax:10 };
+const disp = (k,v) => v === undefined ? v : v / (SCALE[k] || 1);
+const wire = (k,v) => Math.round(Number(v) * (SCALE[k] || 1));
+
+// Every key the C command accepts, in the order the status line reports
+// them. A backup file holds WIRE units - millimetres for the limits, the
+// same numbers C takes - so a restore is a straight replay with no unit
+// conversion to get wrong. SCALE is a panel concern and stops at the panel.
+const CFG_KEYS = ['run','acc','hs','hss','ppr','cpr','thr','bo','wo','mt',
+                  'dir','inv','he','spm','lmin','lmax','eni','ihold'];
+const CFG_FORMAT = 'esp32-4axis-config/1';
+
+// States in which nothing is in motion and a restore is safe.
+const SETTLED = ['idle','homed','FAULT'];
+
 const hasEnc = a => a < ENC;
+let lastStatus = null;       // most recent status object, for the backup file
+let drvOn = true;            // last reported ENA state, machine wide
 let sel = CARDS.map(()=>200);
 let esOn = false;
 // One command path at a time. USB and WiFi reach the same parser on the
@@ -172,13 +219,14 @@ function metricRow(c,label,prefix,unit,deadText){
          + `${dead?deadText:'0'}</span>`;
   }).join('');
   return `<div class="mrow" style="--n:${c.motors.length}">
-            <span class="lbl">${label}</span>${cells}<span class="sub">${unit}</span></div>`;
+            <span class="lbl">${label}</span>${cells}
+            <span class="sub" id="u${prefix}${c.motors[0]}">${unit}</span></div>`;
 }
 
 function cfgFields(list,idPrefix,disabled){
   return list.map(([k,label])=>
     `<div><label>${label}</label>
-       <input id="${idPrefix}${k}" type="number" ${disabled&&k!=='ppr'?'disabled':''}></div>`).join('');
+       <input id="${idPrefix}${k}" type="number" ${SCALE[k]?'step="0.1"':''} ${disabled&&k!=='ppr'?'disabled':''}></div>`).join('');
 }
 
 function build(){
@@ -209,6 +257,7 @@ function build(){
         <div class="body">
           ${heads}
           ${metricRow(c,'position','p','steps','')}
+          ${metricRow(c,'travel','t','cm','')}
           ${metricRow(c,'encoder','e','counts','no feedback')}
           ${metricRow(c,'error','f','counts','&mdash;')}
           ${skew}
@@ -225,6 +274,12 @@ function build(){
             <button id="j${ci}_1" onclick="jog(${ci},1)">JOG &#9654;</button>
           </div>
           <div class="keys"><b>${c.keyLabel}</b></div>
+
+          <div class="goto">
+            <input id="g${ci}" type="number" step="0.1" placeholder="cm"
+                   onkeydown="if(event.key==='Enter')goTo(${ci})">
+            <button onclick="goTo(${ci})">GO TO</button>
+          </div>
           <div class="jog">
             <button class="go" id="hb${ci}" onclick="send('H ${c.cmd}')">${multi?'HOME PAIR':'HOME'}</button>
             <button onclick="send('Z ${c.cmd}')">SET ZERO</button>
@@ -243,6 +298,15 @@ function build(){
                 <select id="k${ci}_he">
                   <option value="0">disabled</option><option value="1">enabled</option>
                 </select></div>
+              <div><label>ENA sense</label>
+                <select id="k${ci}_eni">
+                  <option value="0">conducting = off</option>
+                  <option value="1">conducting = on</option>
+                </select></div>
+              <div><label>on idle timeout</label>
+                <select id="k${ci}_ihold">
+                  <option value="0">release</option><option value="1">stay energised</option>
+                </select></div>
             </div>
             ${c.motors.map(a=>`
               ${multi?`<div class="mtitle">MOTOR ${a+1}</div>`:''}
@@ -258,6 +322,117 @@ function build(){
         </div>
       </div>`));
   });
+}
+
+// =====================================================================
+// Config backup. The board already persists every C to flash, so this is
+// not about saving - it is about having a copy OFF the board. Any change to
+// the AxisConfig struct changes its length, and loadConfig() then ignores
+// the stored blob and comes up on compiled defaults, taking every tuned
+// number with it. A file is what survives that.
+// =====================================================================
+function saveCfgFile(){
+  if(!lastStatus){ log('! nothing to save yet - connect and wait for a status line'); return; }
+
+  const doc = {
+    format: CFG_FORMAT,
+    saved:  new Date().toISOString(),
+    axes:   lastStatus.axis.map(x=>{
+      const o = {};
+      CFG_KEYS.forEach(k=>{ if(x.c[k] !== undefined) o[k] = x.c[k]; });
+      return o;
+    })
+  };
+
+  const name = `stepper-config-${new Date().toISOString().slice(0,10)}.json`;
+  const url  = URL.createObjectURL(new Blob([JSON.stringify(doc,null,2)],
+                                            {type:'application/json'}));
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Revoking in the same tick cancels the download in some browsers.
+  setTimeout(()=>URL.revokeObjectURL(url), 1000);
+  log(`# saved ${name}`);
+}
+
+// A restore rewrites homing direction, travel limits and step rates. Doing
+// that under a moving axis would change the rules mid-move, so it is
+// refused unless every axis has come to rest.
+function machineSettled(){
+  return !!lastStatus && lastStatus.axis.every(x=> !x.moving && SETTLED.includes(x.state));
+}
+
+async function loadCfgFile(input){
+  const f = input.files && input.files[0];
+  input.value = '';                    // so the same file can be chosen twice
+  if(!f) return;
+  if(link === null){ log('! not connected'); return; }
+
+  let doc;
+  try { doc = JSON.parse(await f.text()); }
+  catch(e){ log(`! ${f.name} is not valid JSON`); return; }
+
+  if(doc.format !== CFG_FORMAT){
+    log(`! ${f.name} is not a stepper config file`); return;
+  }
+  if(!Array.isArray(doc.axes) || doc.axes.length !== N){
+    log(`! ${f.name}: expected ${N} axes, found `
+      + `${Array.isArray(doc.axes) ? doc.axes.length : 'none'}`); return;
+  }
+  if(!machineSettled()){
+    log('! restore refused - every axis must be stopped and out of homing'); return;
+  }
+
+  let sent = 0, skipped = 0;
+  for(let a=0; a<N; a++){
+    for(const k of CFG_KEYS){
+      const v = doc.axes[a][k];
+      if(v === undefined) continue;
+      if(typeof v !== 'number' || !Number.isFinite(v)){ skipped++; continue; }
+      await send(`C ${a+1} ${k} ${Math.round(v)}`);
+      sent++;
+      // Each C writes that axis's blob to flash. Pace them so sixty-odd in a
+      // row do not outrun the line parser or the NVS write behind it.
+      await new Promise(r=>setTimeout(r,25));
+    }
+  }
+
+  cfgLoaded = false;        // let the next status frame repaint the panels
+  log(`# restored ${sent} settings from ${f.name}`
+    + (skipped ? ` (${skipped} skipped - not numbers)` : ''));
+}
+
+// Send the state we want, never "the other one". The button reflects the
+// board's last report, and over a link that can drop, a toggle computed at
+// this end is how a machine gets energised while nobody is looking.
+function toggleDrives(){ send(`EN ${drvOn ? 0 : 1}`); }
+
+function applyIdle(){
+  const e = document.getElementById('idleMin');
+  const m = Number(e.value);
+  if(e.value === '' || !Number.isFinite(m) || m < 0){
+    log('! idle disable wants minutes, 0 or more (0 = never)'); return;
+  }
+  send(`IDLE ${Math.round(m * 60)}`);
+}
+
+// Absolute move, in the same centimetres the travel row and the limits use.
+// The conversion runs off the board's own spm rather than a copy kept here,
+// so what is typed, what is clamped and what is displayed are all the same
+// calibration. Raw steps are still reachable as "M <axis> <steps>" from the
+// command bar for anyone who wants them.
+function goTo(ci){
+  const c = CARDS[ci];
+  const e = document.getElementById('g'+ci);
+  const cm = Number(e.value);
+  if(e.value === '' || !Number.isFinite(cm)){ log('! GO TO wants a position in cm'); return; }
+
+  const spm = lastStatus && lastStatus.axis[c.motors[0]].c.spm;
+  if(!spm){ log('! no calibration yet - connect and wait for a status line'); return; }
+
+  send(`M ${c.cmd} ${Math.round(cm * spm / 100)}`);
 }
 
 function pick(ci,v,btn){
@@ -333,12 +508,14 @@ function saveCfg(ci){
   const c = CARDS[ci];
   const put = (axis,key,id)=>{
     const e = document.getElementById(id);
-    if(e && !e.disabled && e.value !== '') send(`C ${axis} ${key} ${e.value}`);
+    if(e && !e.disabled && e.value !== '') send(`C ${axis} ${key} ${wire(key, e.value)}`);
   };
   // shared keys go out once; the firmware mirrors them onto the partner
   SHARED.forEach(([k])=> put(c.cmd,k,`k${ci}_${k}`));
   put(c.cmd,'dir',`k${ci}_dir`);
   put(c.cmd,'he',`k${ci}_he`);
+  put(c.cmd,'eni',`k${ci}_eni`);
+  put(c.cmd,'ihold',`k${ci}_ihold`);
   c.motors.forEach(a=>{
     PERMOTOR.forEach(([k])=> put(a+1,k,`c${a}_${k}`));
     put(a+1,'inv',`c${a}_inv`);
@@ -447,6 +624,15 @@ function cardState(list){
 }
 
 function apply(d){
+  lastStatus = d;
+
+  drvOn = d.drives !== false;
+  const db = document.getElementById('drv');
+  db.textContent = drvOn ? 'DRIVES ON' : 'DRIVES OFF';
+  db.className = 'go drv' + (drvOn ? '' : ' off');
+  if(!cfgLoaded && d.idle !== undefined)
+    document.getElementById('idleMin').value = d.idle / 60;
+
   esOn = d.estop;
   document.getElementById('banner').className = 'banner'+(esOn?' on':'');
   document.getElementById('es').className = 'estop'+(esOn?' armed':'');
@@ -454,6 +640,9 @@ function apply(d){
   for(let a=0;a<N;a++){
     const x = d.axis[a];
     txt('p'+a, x.pos);
+    // Same calibration the firmware clamps against, so what the panel reads
+    // and what a limit acts on can never disagree.
+    txt('t'+a, x.c.spm ? (x.pos * 100 / x.c.spm).toFixed(1) : '--');
     if(hasEnc(a)){
       txt('e'+a, x.enc);
       txt('f'+a, x.err.toFixed(1));
@@ -463,7 +652,7 @@ function apply(d){
 
     if(!cfgLoaded){
       const set=(id,v)=>{const e=document.getElementById(id); if(e) e.value=v;};
-      PERMOTOR.forEach(([k])=> set(`c${a}_${k}`, x.c[k]));
+      PERMOTOR.forEach(([k])=> set(`c${a}_${k}`, disp(k, x.c[k])));
       set(`c${a}_inv`, x.c.inv === undefined ? 0 : x.c.inv);
     }
   }
@@ -478,6 +667,10 @@ function apply(d){
 
     // An axis with homing off should not offer the button at all - a
     // disabled open-loop axis homes by grinding into a stop.
+    // Limits do not bite on an unhomed axis - say so on the travel row
+    // rather than leaving it to be discovered by driving into something.
+    txt('ut'+c.motors[0], first.lim ? 'cm' : 'cm · no limit');
+
     const hb = document.getElementById('hb'+ci);
     if(hb){
       const on = first.c.he !== 0;
@@ -487,9 +680,16 @@ function apply(d){
 
     if(!cfgLoaded){
       const set=(id,v)=>{const e=document.getElementById(id); if(e) e.value=v;};
-      SHARED.forEach(([k])=> set(`k${ci}_${k}`, first.c[k]));
+      SHARED.forEach(([k])=> set(`k${ci}_${k}`, disp(k, first.c[k])));
       set(`k${ci}_dir`, first.c.dir);
       set(`k${ci}_he`, first.c.he === undefined ? 1 : first.c.he);
+      set(`k${ci}_eni`, first.c.eni === undefined ? 0 : first.c.eni);
+      // The travel the axis will actually accept, so the field says what is
+      // in range instead of leaving it to be found by being refused.
+      const g = document.getElementById('g'+ci);
+      if(g && first.c.lmax > first.c.lmin)
+        g.placeholder = `${first.c.lmin/10} to ${first.c.lmax/10} cm`;
+      set(`k${ci}_ihold`, first.c.ihold === undefined ? 0 : first.c.ihold);
     }
   });
 

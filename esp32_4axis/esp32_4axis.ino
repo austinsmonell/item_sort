@@ -97,6 +97,12 @@
 static const uint8_t PUL_PIN[NUM_AXES] = { 25, 27, 18, 17 };
 static const uint8_t DIR_PIN[NUM_AXES] = { 26, 14,  5, 16 };
 
+// ENA+ per axis. None of 23/22/21/19 is a strapping pin, so all four are
+// safe to drive from reset. They idle LOW, which on this wiring leaves the
+// opto dark - the same state as the unwired ENA the drivers ran on before,
+// so a board that reboots comes back with the drives live, not dead.
+static const uint8_t ENA_PIN[NUM_AXES] = { 23, 22, 21, 19 };
+
 #define NUM_ENCODERS 3
 static const uint8_t ENC_A_PIN[NUM_ENCODERS] = { 36, 34, 32 };  // VP, 34, 32
 static const uint8_t ENC_B_PIN[NUM_ENCODERS] = { 39, 35, 33 };  // VN, 35, 33
@@ -118,13 +124,38 @@ struct AxisConfig {
   uint32_t maxHomeTravel;   // give up after this many steps
   uint32_t invertDir;       // 1 = flip this motor's sense (mirrored mount)
   uint32_t homeEnable;      // 0 = refuse to home this axis at all
+  // Linear calibration and soft travel limits. Steps per metre rather than
+  // per mm so an integer keeps the precision: 10913 is 0.003% off the
+  // measured 11000 steps / 1008 mm, which is 0.03 mm over the whole axis.
+  // The limits are held in millimetres because that keeps them integral;
+  // the GUI shows and takes them as centimetres to one decimal.
+  uint32_t stepsPerM;
+  int32_t  limitMinMm;
+  int32_t  limitMaxMm;
+  // ENA polarity, and whether the idle timeout is allowed to drop this axis.
+  // enaInvert 0 means a conducting ENA opto DISABLES the drive, which is how
+  // these inputs are normally read - unwired ENA is the running state. Flip
+  // it for a drive that reads the input the other way round.
+  // idleHold 1 keeps an axis energised through the idle timeout: a drive
+  // that is holding a load against gravity must never be dropped by a clock.
+  uint32_t enaInvert;
+  uint32_t idleHold;
 };
 
 AxisConfig cfg[NUM_AXES] = {
-  // run   accel  home  slow  dir  ppr   cpr   thr  back  offs  maxtrav  inv  home
-  {  2000,  8000,  600,  120,  -1,  2000, 4000,  40,  400,  800, 200000,  0,   1 },  // gantry end A
-  {  2000,  8000,  600,  120,  -1,  2000, 4000,  40,  400,  800, 200000,  0,   1 },  // gantry end B
-  {  2000,  8000,  600,  120,  -1,  2000, 4000,  40,  400,  800, 200000,  0,   1 },
+  // Travel calibration is measured, not derived: the step/rev numbers say
+  // nothing about pulley diameter or screw lead, so these come from driving
+  // a known distance and putting a rule on it.
+  //   axes 1+2   11000 steps = 100.8 cm  ->  10913 steps/m
+  //   axis 3     16000 steps = 148.5 cm  ->  10774 steps/m
+  //   axis 4     47000 steps =  28.0 cm  -> 167857 steps/m
+  // The limits are that measured travel, so a commanded move cannot be told
+  // to leave the rail.
+  //
+  // run   accel  home  slow  dir  ppr   cpr   thr  back  offs  maxtrav  inv  home  spm     lmin  lmax  eni  ihold
+  {  2000,  8000,  600,  120,  -1,  2000, 4000,  40,  400,  800, 200000,  0,   1,   10913,  0,    1008, 0,   0 },  // gantry end A
+  {  2000,  8000,  600,  120,  -1,  2000, 4000,  40,  400,  800, 200000,  0,   1,   10913,  0,    1008, 0,   0 },  // gantry end B
+  {  2000,  8000,  600,  120,  -1,  2000, 4000,  40,  400,  800, 200000,  0,   1,   10774,  0,    1485, 0,   0 },
   // Open loop, NEMA 17 on a 300 mm T8x8 screw: 8 mm lead / 1600 ppr =
   // 200 steps/mm. maxHomeTravel has to be the length of the AXIS, not a
   // round number - with no encoder H_DEADRECKON cannot tell that it has
@@ -135,8 +166,37 @@ AxisConfig cfg[NUM_AXES] = {
   // stop is to drive into it and keep pushing, which is a stalled motor at
   // full current for however long is left in maxHomeTravel. Nothing here
   // can detect arrival. Set a limit switch, or zero it by hand with Z 4.
-  {  2000,  8000,  600,  120,  -1,  1600,    0,   0,  400,  800,  64000,  0,   0 }
+  {  2000,  8000,  600,  120,  -1,  1600,    0,   0,  400,  800,  64000,  0,   0,   167857, 0,    280,  0,   0 }
 };
+
+// ---------------------------------------------------------------------
+// Homing states.
+//
+// THIS HAS TO STAY ABOVE THE FIRST FUNCTION IN THE SKETCH. The .ino
+// preprocessor generates prototypes for every function and inserts them
+// immediately before the first function definition it finds - isGantry(),
+// just below. A type used in any signature must therefore be declared
+// above that point, or the generated prototype references a type that does
+// not exist yet: "'HomeState' has not been declared". pairAt() and
+// holdAtTouch() both take one.
+// ---------------------------------------------------------------------
+// H_TOUCH_1 and H_TOUCH_2 are the gantry synchronisation points: an end
+// that has found its stop parks there, motor holding, until its partner
+// has found its own. No end ever leaves a stop on its own.
+enum HomeState : uint8_t {
+  H_IDLE = 0, H_APPROACH_FAST, H_TOUCH_1, H_BACKOFF_1, H_APPROACH_SLOW,
+  H_TOUCH_2, H_MOVE_TO_ZERO, H_DONE, H_FAULT, H_DEADRECKON
+};
+
+static const char* HOME_STATE_NAME[] = {
+  "idle", "approach", "touch", "backoff", "precise",
+  "touch2", "offset", "homed", "FAULT", "blind"
+};
+
+// The names are indexed by the enum, so a state added to one and not the
+// other reads off the end of the array in every status line.
+static_assert(sizeof(HOME_STATE_NAME) / sizeof(HOME_STATE_NAME[0]) == H_DEADRECKON + 1,
+              "HOME_STATE_NAME is out of step with HomeState");
 
 // ---------------------------------------------------------------------
 // Gantry pair. Axes 1 and 2 (indices 0 and 1) drive opposite ends of the
@@ -153,24 +213,20 @@ static inline int  partnerOf(int a) { return (a == GANTRY_A) ? GANTRY_B : GANTRY
 static inline int afterGantry() { return (GANTRY_A > GANTRY_B ? GANTRY_A : GANTRY_B) + 1; }
 
 // ---------------------------------------------------------------------
-// Homing state machine
+// Homing state machine. The HomeState enum itself lives further up, above
+// the first function in the file - see the note there.
 // ---------------------------------------------------------------------
-enum HomeState : uint8_t {
-  H_IDLE = 0, H_APPROACH_FAST, H_BACKOFF_1, H_APPROACH_SLOW,
-  H_MOVE_TO_ZERO, H_DONE, H_FAULT, H_DEADRECKON
-};
-
-static const char* HOME_STATE_NAME[] = {
-  "idle", "approach", "backoff", "precise", "offset", "homed", "FAULT", "blind"
-};
-
 struct AxisState {
-  HomeState home            = H_IDLE;
-  bool      isHomed         = false;
-  int32_t   homeStartSteps  = 0;
-  int64_t   homeStartCounts = 0;
-  float     lastError       = 0.0f;
-  char      fault[48]       = "";
+  HomeState home        = H_IDLE;
+  bool      isHomed     = false;
+  // Baseline for the CURRENT stall-detection window, not for the whole
+  // approach - see stallDetected().
+  int32_t   winSteps    = 0;
+  int64_t   winCounts   = 0;
+  bool      winArmed    = false;
+  uint32_t  moveMs      = 0;      // when the current homing move was issued
+  float     lastError   = 0.0f;
+  char      fault[48]   = "";
 };
 
 AxisState st[NUM_AXES];
@@ -179,6 +235,12 @@ FastAccelStepperEngine engine = FastAccelStepperEngine();
 FastAccelStepper* stepper[NUM_AXES] = { nullptr, nullptr, nullptr, nullptr };
 ESP32Encoder encoder[NUM_ENCODERS];
 Preferences prefs;
+
+bool     drivesEnabled = true;   // what was last ASKED for, machine wide
+bool     axisLive[NUM_AXES] = { true, true, true, true };  // what each ENA pin is doing
+uint32_t idleTimeoutS  = 300;    // drop the drives after this long unmoving; 0 = never
+uint32_t lastMotionMs  = 0;
+int64_t  enaCounts[NUM_AXES] = { 0, 0, 0, 0 };   // encoder reading when last disabled
 
 bool     estopActive = false;
 int      homeChain   = -1;      // >=0 while HOME ALL walks the axes in turn
@@ -247,6 +309,15 @@ static void applyDirection(int a) {
   stepper[a]->setDirectionPin(DIR_PIN[a], cfg[a].invertDir == 0, DIR_SETUP_US);
 }
 
+// Common cathode, same as PUL and DIR: driving ENA+ HIGH lights the opto.
+// A conducting ENA input is what switches these drives OFF, so "enabled"
+// is the dark, LOW state - which is exactly what the pins do at reset.
+static void applyEnable(int a) {
+  bool level = !axisLive[a];                    // HIGH asserts ENA = disabled
+  if (cfg[a].enaInvert) level = !level;
+  digitalWrite(ENA_PIN[a], level ? HIGH : LOW);
+}
+
 static void applyAxisSpeed(int a, uint32_t speed) {
   if (!stepper[a]) return;
   stepper[a]->setSpeedInHz(speed);
@@ -259,6 +330,59 @@ static void stopAll() {
     if (stepper[a]) stepper[a]->forceStopAndNewPosition(stepper[a]->getCurrentPosition());
     if (st[a].home != H_FAULT && st[a].home != H_DONE) st[a].home = H_IDLE;
   }
+}
+
+// Cutting the current to a stepper releases its holding torque: the axis can
+// then be pushed, or fall. Two consequences are handled here.
+//
+// Never drop a moving axis - stop it first, or the load carries on under its
+// own momentum with nothing resisting.
+//
+// And a disabled axis may not be where it was left. The encoders keep
+// counting whether the drive is powered or not, so on re-enable a closed loop
+// axis can be asked whether it actually moved, and only the ones that did
+// lose their homing. Axis 4 has no encoder and cannot be asked, so it always
+// does - there is no honest alternative.
+//
+// fromIdle separates the clock from the operator. An axis with idleHold set
+// rides out the timeout still energised - a drive holding a load against
+// gravity must not be released because nothing happened for a while - but
+// EN 0 is a deliberate instruction and releases everything.
+static void setDrives(bool on, bool fromIdle) {
+  if (on == drivesEnabled) return;
+
+  if (!on) {
+    stopAll();
+    for (int a = 0; a < NUM_AXES; a++) enaCounts[a] = encCount(a);
+  }
+
+  drivesEnabled = on;
+  int held = 0;
+  for (int a = 0; a < NUM_AXES; a++) {
+    axisLive[a] = on || (fromIdle && cfg[a].idleHold);
+    if (!on && axisLive[a]) held++;
+    applyEnable(a);
+  }
+  lastMotionMs = millis();
+
+  if (on) {
+    for (int a = 0; a < NUM_AXES; a++) {
+      if (!st[a].isHomed) continue;
+      if (!hasEncoder(a)) {
+        st[a].isHomed = false;
+        outf("# axis %d: open loop, position unverifiable after a disable - re-home", a + 1);
+      } else {
+        int64_t drift = llabs(encCount(a) - enaCounts[a]);
+        if (drift > (int64_t)cfg[a].stallThreshold) {
+          st[a].isHomed = false;
+          outf("# axis %d moved %ld counts while disabled - re-home", a + 1, (long)drift);
+        }
+      }
+    }
+  }
+
+  if (held) outf("# drives DISABLED (%d held live by ihold)", held);
+  else      outf("# drives %s", on ? "ENABLED" : "DISABLED");
 }
 
 // A gantry end that faults has to take its partner down with it: one end
@@ -276,35 +400,121 @@ static void faultAxis(int a, const char* msg) {
 // =====================================================================
 // Homing
 // =====================================================================
+
+// Stall detection runs over a sliding window of commanded steps, never
+// over the whole approach. Integrating from the start of the move made the
+// effective margin shrink with distance - 40 counts is 1% slip over 2000
+// steps but 0.02% over 100000 - so a long approach would trip a phantom
+// stall in mid-air. On the gantry that is worse than a false alarm: the
+// end that trips backs off while its partner is still driving in, and the
+// two motors fight across the rail until a driver latches its position
+// error alarm, which with ALM and ENA unwired needs a power cycle to
+// clear. Re-baselining every window makes detection independent of how far
+// out homing started.
+//
+// Sizing: a real stall adds countsPerStep of error per commanded step, so
+// it clears stallThreshold in thr/countsPerStep steps - 20 with the stock
+// numbers. A window several times that leaves the trip comfortable while
+// giving slow drift no room to accumulate.
+static const int32_t STALL_WINDOW_STEPS = 100;
+
+// The first window of an approach spans the acceleration ramp, where the
+// encoder legitimately lags. Blank that one, run armed from there on.
+static const int32_t STALL_BLANK_STEPS = 50;
+
+static void armStallWindow(int a) {
+  if (!stepper[a]) return;
+  st[a].winSteps  = stepper[a]->getCurrentPosition();
+  st[a].winCounts = encCount(a);
+  st[a].winArmed  = false;
+  st[a].lastError = 0.0f;
+}
+
+// FastAccelStepper does not always report isRunning() on the same pass a
+// move is issued, and both ends of a pair are now released inside a single
+// pass, so "stopped" has to mean "stopped, and the command has had time to
+// take". This also covers a zero-length move - backoffSteps or workOffset
+// set to 0 - which never runs at all and would otherwise hang the state
+// machine waiting for a motion that never starts.
+static const uint32_t MOVE_SETTLE_MS = 5;
+
+static bool moveFinished(int a) {
+  if (millis() - st[a].moveMs < MOVE_SETTLE_MS) return false;
+  return !stepper[a]->isRunning();
+}
+
 static void beginHome(int a) {
   if (estopActive || !stepper[a]) return;
 
   st[a].isHomed = false;
   st[a].fault[0] = '\0';
-  st[a].homeStartSteps  = stepper[a]->getCurrentPosition();
-  st[a].homeStartCounts = encCount(a);
-  st[a].lastError = 0.0f;
+  armStallWindow(a);
 
   if (!hasEncoder(a)) {
     st[a].home = H_DEADRECKON;
     applyAxisSpeed(a, cfg[a].homeSpeedSlow);
     stepper[a]->move(cfg[a].homeDir * (int32_t)cfg[a].maxHomeTravel);
+    st[a].moveMs = millis();
     return;
   }
 
   st[a].home = H_APPROACH_FAST;
   applyAxisSpeed(a, cfg[a].homeSpeed);
   stepper[a]->move(cfg[a].homeDir * (int32_t)cfg[a].maxHomeTravel);
+  st[a].moveMs = millis();
 }
 
 static bool stallDetected(int a) {
-  if (!hasEncoder(a)) return false;
-  int32_t stepsMoved = abs(stepper[a]->getCurrentPosition() - st[a].homeStartSteps);
-  if (stepsMoved < 50) return false;            // ignore acceleration lag
-  int64_t encMoved = llabs(encCount(a) - st[a].homeStartCounts);
-  float   expected = (float)stepsMoved * countsPerStep[a];
-  st[a].lastError  = expected - (float)encMoved;
-  return st[a].lastError > (float)cfg[a].stallThreshold;
+  if (!hasEncoder(a) || !stepper[a]) return false;
+
+  int32_t stepsMoved = abs(stepper[a]->getCurrentPosition() - st[a].winSteps);
+  int64_t encMoved   = llabs(encCount(a) - st[a].winCounts);
+  st[a].lastError    = (float)stepsMoved * countsPerStep[a] - (float)encMoved;
+
+  if (st[a].winArmed && st[a].lastError > (float)cfg[a].stallThreshold) return true;
+
+  // Window closed with no stall: drop the baseline here and start over, so
+  // nothing carries forward into the next one.
+  if (stepsMoved >= (st[a].winArmed ? STALL_WINDOW_STEPS : STALL_BLANK_STEPS)) {
+    st[a].winSteps  = stepper[a]->getCurrentPosition();
+    st[a].winCounts = encCount(a);
+    st[a].winArmed  = true;
+    st[a].lastError = 0.0f;
+  }
+  return false;
+}
+
+// Both ends of a pair sitting at the same touch state - the condition for
+// either of them to move again. A lone axis only answers for itself.
+static bool pairAt(int a, HomeState h) {
+  if (st[a].home != h) return false;
+  return !isGantry(a) || st[partnerOf(a)].home == h;
+}
+
+// Park at the stop the instant it is found: stop pulsing and hold, no
+// backoff and no zeroing yet. The partner may still be driving in, and the
+// rail must not be pulled from this end while it does.
+static void holdAtTouch(int a, HomeState touch) {
+  stepper[a]->forceStopAndNewPosition(stepper[a]->getCurrentPosition());
+  st[a].home = touch;
+}
+
+// Leaving a touch is done for the whole pair at once, by whichever end
+// notices the pair is complete. Advancing one end at a time would not
+// work: the loop services axis 0, moves it on, then tests axis 1 against a
+// partner that has already left the touch state.
+static void startBackoff(int a) {
+  st[a].home = H_BACKOFF_1;
+  applyAxisSpeed(a, cfg[a].runSpeed);
+  stepper[a]->move(-cfg[a].homeDir * (int32_t)cfg[a].backoffSteps);
+  st[a].moveMs = millis();
+}
+
+static void startWorkOffset(int a) {
+  st[a].home = H_MOVE_TO_ZERO;
+  applyAxisSpeed(a, cfg[a].runSpeed);
+  stepper[a]->moveTo(-cfg[a].homeDir * (int32_t)cfg[a].workOffset);
+  st[a].moveMs = millis();
 }
 
 static void serviceHoming(int a) {
@@ -315,43 +525,58 @@ static void serviceHoming(int a) {
 
     case H_APPROACH_FAST:
       if (stallDetected(a)) {
-        s->forceStopAndNewPosition(s->getCurrentPosition());
-        st[a].home = H_BACKOFF_1;
-        applyAxisSpeed(a, cfg[a].runSpeed);
-        s->move(-cfg[a].homeDir * (int32_t)cfg[a].backoffSteps);
-      } else if (!s->isRunning()) {
+        holdAtTouch(a, H_TOUCH_1);
+      } else if (moveFinished(a)) {
         char msg[48];
         snprintf(msg, sizeof(msg), "no stop in %u steps", cfg[a].maxHomeTravel);
         faultAxis(a, msg);
       }
       break;
 
+    // Holding at the stop, waiting for the other end. An end that never
+    // arrives runs out its maxHomeTravel and faults, and faultAxis takes
+    // this one down with it, so the wait cannot hang.
+    case H_TOUCH_1:
+      if (pairAt(a, H_TOUCH_1)) {
+        startBackoff(a);
+        if (isGantry(a)) startBackoff(partnerOf(a));
+      }
+      break;
+
+    // Both ends were released together and are running the same relative
+    // move at the same speed, so they clear the stop together too.
     case H_BACKOFF_1:
-      if (!s->isRunning()) {
+      if (moveFinished(a)) {
         st[a].home = H_APPROACH_SLOW;
-        st[a].homeStartSteps  = s->getCurrentPosition();
-        st[a].homeStartCounts = encCount(a);
+        armStallWindow(a);
         applyAxisSpeed(a, cfg[a].homeSpeedSlow);
         s->move(cfg[a].homeDir * (int32_t)(cfg[a].backoffSteps * 3));
+        st[a].moveMs = millis();
       }
       break;
 
     case H_APPROACH_SLOW:
       if (stallDetected(a)) {
-        s->forceStopAndNewPosition(s->getCurrentPosition());
-        // The slow second touch is the repeatable one: call it zero.
+        holdAtTouch(a, H_TOUCH_2);
+        // The slow second touch is the repeatable one, and each end calls
+        // its OWN touch zero - that per-end reference is what squares the
+        // rail. Only the move off the stop is shared.
         s->setCurrentPosition(0);
         if (hasEncoder(a)) encoder[a].setCount(0);
-        st[a].home = H_MOVE_TO_ZERO;
-        applyAxisSpeed(a, cfg[a].runSpeed);
-        s->moveTo(-cfg[a].homeDir * (int32_t)cfg[a].workOffset);
-      } else if (!s->isRunning()) {
+      } else if (moveFinished(a)) {
         faultAxis(a, "lost contact on slow approach");
       }
       break;
 
+    case H_TOUCH_2:
+      if (pairAt(a, H_TOUCH_2)) {
+        startWorkOffset(a);
+        if (isGantry(a)) startWorkOffset(partnerOf(a));
+      }
+      break;
+
     case H_MOVE_TO_ZERO:
-      if (!s->isRunning()) {
+      if (moveFinished(a)) {
         s->setCurrentPosition(0);
         if (hasEncoder(a)) encoder[a].setCount(0);
         st[a].isHomed = true;
@@ -363,10 +588,11 @@ static void serviceHoming(int a) {
     case H_DEADRECKON:
       // Open loop: cannot see the stall, so run the bounded move out and
       // treat wherever we end up as zero. Steps will be lost by design.
-      if (!s->isRunning()) {
+      if (moveFinished(a)) {
         s->setCurrentPosition(0);
         applyAxisSpeed(a, cfg[a].runSpeed);
         s->moveTo(-cfg[a].homeDir * (int32_t)cfg[a].workOffset);
+        st[a].moveMs = millis();
         st[a].isHomed = true;
         st[a].home = H_DONE;
         outf("# axis %d blind-homed (approximate)", a + 1);
@@ -412,15 +638,85 @@ static void serviceSyncWatch(int a) {
 // the command out to both ends of the gantry, so no caller - GUI or serial
 // monitor - can move one end on its own.
 // =====================================================================
-static void issueMove(int a, long v, bool absolute) {
-  if (!stepper[a]) return;
-  applyAxisSpeed(a, cfg[a].runSpeed);
-  if (absolute) stepper[a]->moveTo(v); else stepper[a]->move(v);
+// =====================================================================
+// Soft travel limits
+// =====================================================================
+static inline long mmToSteps(int a, int32_t mm) {
+  return (long)(((int64_t)mm * (int64_t)cfg[a].stepsPerM) / 1000);
 }
 
+// A span of zero or less switches the limit off for that axis.
+static inline bool limitsActive(int a) {
+  return cfg[a].limitMaxMm > cfg[a].limitMinMm;
+}
+
+// A soft limit only means anything against a known reference. Before homing,
+// position 0 is wherever the board happened to power up, so the limits would
+// clamp against nothing - and an unhomed axis has to be free to move or it
+// could never be homed at all. Homing itself drives the stepper directly and
+// never comes through here.
+static long clampToLimits(int a, long target) {
+  if (!limitsActive(a) || !st[a].isHomed) return target;
+  long lo = mmToSteps(a, cfg[a].limitMinMm);
+  long hi = mmToSteps(a, cfg[a].limitMaxMm);
+  if (target < lo) return lo;
+  if (target > hi) return hi;
+  return target;
+}
+
+// Where the last accepted command aims each axis. The library cannot answer
+// this: getPositionAfterCommandsCompleted() reports the end of the step
+// QUEUE, which is a few milliseconds of steps, not the end of the ramp. Ask
+// it where a move will finish and it answers with roughly the current
+// position, so a burst of jogs each measured its delta from where the axis
+// happened to be and stacked straight through the limit.
+static long cmdTarget[NUM_AXES] = { 0, 0, 0, 0 };
+
+// Everything goes out as an absolute moveTo against a target this file owns,
+// so no relative-move bookkeeping inside the library can be raced. The
+// re-sync matters because a stopped axis may have been moved by something
+// that never came through here - homing, S, a fault, e-stop, Z.
+static void issueMove(int a, long v, bool absolute) {
+  if (!stepper[a]) return;
+  if (!stepper[a]->isRunning()) cmdTarget[a] = stepper[a]->getCurrentPosition();
+
+  long target = clampToLimits(a, absolute ? v : cmdTarget[a] + v);
+  applyAxisSpeed(a, cfg[a].runSpeed);
+  stepper[a]->moveTo(target);
+  cmdTarget[a] = target;
+}
+
+// Clamped once, against the commanding axis, and the SAME adjustment goes to
+// both ends of a pair. A relative move stays relative: the two ends sit at
+// their own stop-referenced zeros, so turning a jog into an absolute target
+// taken from one end would snap the other across the skew and rack the rail.
+//
+// Position after commands completed, not current position: J adds to the move
+// already in flight, so that is the number the limit has to be tested against
+// or stacked jogs would walk straight through it.
 static void commandMove(int a, long v, bool absolute) {
-  issueMove(a, v, absolute);
-  if (isGantry(a)) issueMove(partnerOf(a), v, absolute);
+  if (!stepper[a]) return;
+  if (!stepper[a]->isRunning()) cmdTarget[a] = stepper[a]->getCurrentPosition();
+
+  long want    = absolute ? v : cmdTarget[a] + v;
+  long clamped = clampToLimits(a, want);
+
+  if (clamped != want)
+    outf("# axis %d limited to %ld steps (travel %ld to %ld mm = %ld to %ld steps)",
+         a + 1, clamped, (long)cfg[a].limitMinMm, (long)cfg[a].limitMaxMm,
+         mmToSteps(a, cfg[a].limitMinMm), mmToSteps(a, cfg[a].limitMaxMm));
+
+  if (absolute) {
+    issueMove(a, clamped, true);
+    if (isGantry(a)) issueMove(partnerOf(a), clamped, true);
+  } else {
+    // Already sitting on the limit: send nothing rather than a zero-length
+    // move, so holding the jog key cannot keep restarting the ramp.
+    long dv = clamped - cmdTarget[a];
+    if (dv == 0) return;
+    issueMove(a, dv, false);
+    if (isGantry(a)) issueMove(partnerOf(a), dv, false);
+  }
 }
 
 static void zeroOne(int a) {
@@ -471,6 +767,27 @@ static bool busyHoming(int a) {
   return false;
 }
 
+static bool anyMoving() {
+  for (int a = 0; a < NUM_AXES; a++)
+    if (stepper[a] && stepper[a]->isRunning()) return true;
+  return false;
+}
+
+// Idle timeout. Homing counts as activity even in the touch states, where
+// both ends are deliberately standing still waiting for each other - a clock
+// must not cut the current out from under a half-finished home.
+static void serviceIdle() {
+  bool active = anyMoving();
+  for (int a = 0; a < NUM_AXES && !active; a++) if (busyHoming(a)) active = true;
+
+  if (active) { lastMotionMs = millis(); return; }
+  if (!drivesEnabled || idleTimeoutS == 0) return;
+  if (millis() - lastMotionMs < idleTimeoutS * 1000UL) return;
+
+  outf("# idle %u s - dropping the drives", idleTimeoutS);
+  setDrives(false, true);
+}
+
 // =====================================================================
 // Persistence
 // =====================================================================
@@ -482,8 +799,15 @@ static void saveConfig(int a) {
   prefs.end();
 }
 
+static void saveMachine() {
+  prefs.begin("axes", false);
+  prefs.putUInt("idle", idleTimeoutS);
+  prefs.end();
+}
+
 static void loadConfig() {
   prefs.begin("axes", true);
+  idleTimeoutS = prefs.getUInt("idle", 300);
   for (int a = 0; a < NUM_AXES; a++) {
     char key[16];
     snprintf(key, sizeof(key), "a%d", a);
@@ -502,6 +826,8 @@ static void loadConfig() {
 static void emitStatus() {
   String j = "{\"estop\":";
   j += estopActive ? "true" : "false";
+  j += ",\"drives\":";  j += drivesEnabled ? "true" : "false";
+  j += ",\"idle\":";    j += idleTimeoutS;
   j += ",\"axis\":[";
   for (int a = 0; a < NUM_AXES; a++) {
     if (a) j += ',';
@@ -525,7 +851,17 @@ static void emitStatus() {
     j += ",\"dir\":"; j += cfg[a].homeDir;
     j += ",\"inv\":"; j += cfg[a].invertDir;
     j += ",\"he\":";  j += cfg[a].homeEnable;
-    j += "}}";
+    j += ",\"spm\":";  j += cfg[a].stepsPerM;
+    j += ",\"lmin\":"; j += cfg[a].limitMinMm;
+    j += ",\"lmax\":"; j += cfg[a].limitMaxMm;
+    j += ",\"eni\":";  j += cfg[a].enaInvert;
+    j += ",\"ihold\":"; j += cfg[a].idleHold;
+    j += "}";
+    // Outside "c" because it is not a setting - it is whether the settings
+    // are biting right now. A limit on an unhomed axis is not enforced, and
+    // that is worth seeing rather than guessing at.
+    j += ",\"lim\":"; j += (limitsActive(a) && st[a].isHomed) ? "true" : "false";
+    j += "}";
   }
   j += "]}";
   outLine(j.c_str());
@@ -542,11 +878,19 @@ static void printHelp() {
   outLine("#   HA                   home all, one at a time");
   outLine("#   Z <axis>             set current position as zero");
   outLine("#   S                    stop all motion");
+  outLine("#   EN 1 | EN 0          energise / release all drives (EN alone reports)");
+  outLine("#   IDLE <sec>           drop the drives after this long unmoving, 0 = never");
   outLine("#   E 1 | E 0            engage / release e-stop");
   outLine("#   C <axis> <key> <val> set config, then saved to flash");
   outLine("#     keys: run acc hs hss ppr cpr thr bo wo mt dir inv he");
-  outLine("#     run acc hs hss bo wo mt dir he mirror across axes 1+2;");
-  outLine("#     ppr cpr thr inv stay per motor");
+  outLine("#           spm lmin lmax eni ihold");
+  outLine("#     spm = steps per metre; lmin/lmax = soft travel limits in mm");
+  outLine("#     (the GUI takes those as cm). lmax <= lmin turns the limit");
+  outLine("#     off, and limits only apply once the axis is homed.");
+  outLine("#     eni = 1 if a conducting ENA input ENABLES that drive;");
+  outLine("#     ihold = 1 keeps the axis live through the idle timeout");
+  outLine("#     run acc hs hss bo wo mt dir he spm lmin lmax eni ihold mirror");
+  outLine("#     across axes 1+2; ppr cpr thr inv stay per motor");
   outLine("#   ?                    print one status line");
   outLine("#   V 1 | V 0            status streaming on / off");
   outLine("#   T <axis>             self test: report state, then step slowly");
@@ -573,11 +917,17 @@ static bool applyConfigKey(int a, const String& key, long val) {
   else if (key == "dir") cfg[a].homeDir         = (val >= 0) ? 1 : -1;
   else if (key == "inv") cfg[a].invertDir       = (val != 0) ? 1 : 0;
   else if (key == "he")  cfg[a].homeEnable      = (val != 0) ? 1 : 0;
+  else if (key == "spm") cfg[a].stepsPerM        = max(1L, val);
+  else if (key == "lmin") cfg[a].limitMinMm      = (int32_t)val;   // may be negative
+  else if (key == "lmax") cfg[a].limitMaxMm      = (int32_t)val;
+  else if (key == "eni") cfg[a].enaInvert         = (val != 0) ? 1 : 0;
+  else if (key == "ihold") cfg[a].idleHold        = (val != 0) ? 1 : 0;
   else return false;
 
   recomputeRatios();
   applyAxisSpeed(a, cfg[a].runSpeed);
   applyDirection(a);
+  applyEnable(a);
   saveConfig(a);
   return true;
 }
@@ -586,9 +936,10 @@ static bool applyConfigKey(int a, const String& key, long val) {
 // on every move, so the motion keys mirror across the pair. The rest stay
 // per motor: they describe one drive's own hardware.
 static bool isSharedKey(const String& key) {
-  return key == "run" || key == "acc" || key == "hs" || key == "hss" ||
-         key == "bo"  || key == "wo"  || key == "dir" || key == "mt" ||
-         key == "he";
+  return key == "run"  || key == "acc"  || key == "hs"   || key == "hss" ||
+         key == "bo"   || key == "wo"   || key == "dir"  || key == "mt"   ||
+         key == "he"   || key == "spm"  || key == "lmin" || key == "lmax" ||
+         key == "eni"  || key == "ihold";
 }
 
 static void handleConfigCmd(int a, String key, long val) {
@@ -646,8 +997,36 @@ static void execLine(String line) {
     return;
   }
 
+  // EN with no argument reports rather than guessing which way to toggle:
+  // a control that can be told "the other one" over a link that drops is a
+  // control that eventually energises a machine nobody is watching.
+  if (cmd == "EN") {
+    if (n < 2) { outf("# drives %s", drivesEnabled ? "ENABLED" : "DISABLED"); return; }
+    if (estopActive && tok[1].toInt() != 0) {
+      outLine("# blocked: e-stop engaged"); return;
+    }
+    setDrives(tok[1].toInt() != 0, false);
+    return;
+  }
+
+  if (cmd == "IDLE") {
+    if (n < 2) {
+      if (idleTimeoutS) outf("# idle timeout %u s", idleTimeoutS);
+      else              outLine("# idle timeout off");
+      return;
+    }
+    long v = tok[1].toInt();
+    idleTimeoutS = (v < 0) ? 0 : (uint32_t)v;
+    lastMotionMs = millis();
+    saveMachine();
+    if (idleTimeoutS) outf("# idle timeout %u s (saved)", idleTimeoutS);
+    else              outLine("# idle timeout off (saved)");
+    return;
+  }
+
   if (cmd == "HA") {
     if (estopActive) { outLine("# blocked: e-stop engaged"); return; }
+    if (!drivesEnabled) { outLine("# blocked: drives disabled - EN 1 first"); return; }
     int first = nextHomingAxis(0);
     if (first >= NUM_AXES) { outLine("# no axis has homing enabled"); return; }
     homeChain = first;
@@ -663,6 +1042,7 @@ static void execLine(String line) {
 
   if (cmd == "H") {
     if (estopActive) { outLine("# blocked: e-stop engaged"); return; }
+    if (!drivesEnabled) { outLine("# blocked: drives disabled - EN 1 first"); return; }
     commandHome(a);
     if (isGantry(a)) outf("# homing gantry pair (axes %d+%d)", GANTRY_A + 1, GANTRY_B + 1);
     else             outf("# homing axis %d", a + 1);
@@ -689,6 +1069,7 @@ static void execLine(String line) {
          cfg[a].invertDir, cfg[a].homeEnable);
     if (!stepper[a]) { outf("# axis %d: cannot test, no stepper", a + 1); return; }
     if (estopActive) { outf("# axis %d: cannot test, e-stop engaged", a + 1); return; }
+    if (!drivesEnabled) { outf("# axis %d: cannot test, drives disabled", a + 1); return; }
 
     // 200 steps at 200 Hz is one full second of stepping - slow enough to
     // watch the shaft and to meter the pulse line by hand.
@@ -716,6 +1097,10 @@ static void execLine(String line) {
 
   if (cmd == "J" || cmd == "M") {
     if (estopActive) { outLine("# blocked: e-stop engaged"); return; }
+    // Deliberately not an auto-enable. A disabled axis may have been pushed,
+    // and re-enabling is where that gets checked and reported - silently
+    // doing it under a jog would bury the one message worth reading.
+    if (!drivesEnabled) { outLine("# blocked: drives disabled - EN 1 first"); return; }
     if (!stepper[a]) return;
     if (busyHoming(a)) { outf("# axis %d busy homing", a + 1); return; }
     if (n < 3) { outLine("# missing distance"); return; }
@@ -735,12 +1120,6 @@ static void execLine(String line) {
 // =====================================================================
 // Network
 // =====================================================================
-static bool anyMoving() {
-  for (int a = 0; a < NUM_AXES; a++)
-    if (stepper[a] && stepper[a]->isRunning()) return true;
-  return false;
-}
-
 // A WebSocket frame is one command line, byte for byte what the serial
 // monitor would take. Keeping one parser for both transports is the whole
 // reason the protocol is line based.
@@ -846,6 +1225,14 @@ void setup() {
   loadConfig();
   recomputeRatios();
 
+  // Before anything can step: an output left as a floating input is at the
+  // mercy of whatever the opto leaks.
+  for (int a = 0; a < NUM_AXES; a++) {
+    pinMode(ENA_PIN[a], OUTPUT);
+    applyEnable(a);
+  }
+  lastMotionMs = millis();
+
   engine.init();
   for (int a = 0; a < NUM_AXES; a++) {
     stepper[a] = engine.stepperConnectToPin(PUL_PIN[a]);
@@ -915,6 +1302,8 @@ void loop() {
       }
     }
   }
+
+  serviceIdle();
 
   // --- periodic status ------------------------------------------------
   static uint32_t lastStream = 0;
