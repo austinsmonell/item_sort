@@ -239,8 +239,23 @@ Preferences prefs;
 bool     drivesEnabled = true;   // what was last ASKED for, machine wide
 bool     axisLive[NUM_AXES] = { true, true, true, true };  // what each ENA pin is doing
 uint32_t idleTimeoutS  = 300;    // drop the drives after this long unmoving; 0 = never
+bool     faultKillsDrives = true;   // on a fault, release every drive (like E 1)
 uint32_t lastMotionMs  = 0;
 int64_t  enaCounts[NUM_AXES] = { 0, 0, 0, 0 };   // encoder reading when last disabled
+
+// Shadow of where the last accepted command aims each axis, and the millis()
+// it was set. issueMove() owns these; anything that moves an axis WITHOUT
+// going through issueMove() - homing, S, a fault, Z - resets them so the next
+// jog measures from the truth and not from a target that no longer applies.
+// See the note above issueMove() for why a plain getCurrentPosition() re-sync
+// is not enough on its own.
+long     cmdTarget[NUM_AXES]   = { 0, 0, 0, 0 };
+uint32_t cmdTargetMs[NUM_AXES] = { 0, 0, 0, 0 };
+
+static void setCmdTarget(int a, long v) {
+  cmdTarget[a]   = v;
+  cmdTargetMs[a] = millis();
+}
 
 bool     estopActive = false;
 int      homeChain   = -1;      // >=0 while HOME ALL walks the axes in turn
@@ -327,7 +342,10 @@ static void applyAxisSpeed(int a, uint32_t speed) {
 static void stopAll() {
   homeChain = -1;
   for (int a = 0; a < NUM_AXES; a++) {
-    if (stepper[a]) stepper[a]->forceStopAndNewPosition(stepper[a]->getCurrentPosition());
+    if (stepper[a]) {
+      stepper[a]->forceStopAndNewPosition(stepper[a]->getCurrentPosition());
+      setCmdTarget(a, stepper[a]->getCurrentPosition());   // shadow follows the abrupt stop
+    }
     if (st[a].home != H_FAULT && st[a].home != H_DONE) st[a].home = H_IDLE;
   }
 }
@@ -385,16 +403,41 @@ static void setDrives(bool on, bool fromIdle) {
   else      outf("# drives %s", on ? "ENABLED" : "DISABLED");
 }
 
+// Release every drive and halt everything, the way E 1 does. setDrives() no-ops
+// when the drives are already logically off, so the hand sweep afterwards is
+// what guarantees an idleHold axis goes dark too. drivesEnabled is left off:
+// nothing re-energises without a deliberate EN 1.
+static void killDrives() {
+  stopAll();
+  setDrives(false, false);
+  for (int a = 0; a < NUM_AXES; a++) {
+    if (axisLive[a]) enaCounts[a] = encCount(a);
+    axisLive[a] = false;
+    applyEnable(a);
+  }
+}
+
 // A gantry end that faults has to take its partner down with it: one end
 // still driving while the other has stopped is exactly how a rail racks.
 static void faultAxis(int a, const char* msg) {
   if (st[a].home == H_FAULT) return;
-  if (stepper[a]) stepper[a]->forceStopAndNewPosition(stepper[a]->getCurrentPosition());
+  if (stepper[a]) {
+    stepper[a]->forceStopAndNewPosition(stepper[a]->getCurrentPosition());
+    setCmdTarget(a, stepper[a]->getCurrentPosition());
+  }
   st[a].home    = H_FAULT;
   st[a].isHomed = false;
   snprintf(st[a].fault, sizeof(st[a].fault), "%s", msg);
   outf("# axis %d FAULT: %s", a + 1, msg);
   if (isGantry(a)) faultAxis(partnerOf(a), "partner faulted");   // recurses once
+
+  // Safety switch (FD, on by default): a fault drops every drive. The
+  // drivesEnabled guard means the gantry recursion above does not fire this
+  // twice - the first call takes the drives down, the second sees them gone.
+  if (faultKillsDrives && drivesEnabled) {
+    outLine("# fault - all drives OFF (FD 0 to disable this)");
+    killDrives();
+  }
 }
 
 // =====================================================================
@@ -563,6 +606,7 @@ static void serviceHoming(int a) {
         // rail. Only the move off the stop is shared.
         s->setCurrentPosition(0);
         if (hasEncoder(a)) encoder[a].setCount(0);
+        setCmdTarget(a, 0);
       } else if (moveFinished(a)) {
         faultAxis(a, "lost contact on slow approach");
       }
@@ -579,6 +623,7 @@ static void serviceHoming(int a) {
       if (moveFinished(a)) {
         s->setCurrentPosition(0);
         if (hasEncoder(a)) encoder[a].setCount(0);
+        setCmdTarget(a, 0);
         st[a].isHomed = true;
         st[a].home = H_DONE;
         outf("# axis %d homed", a + 1);
@@ -592,6 +637,7 @@ static void serviceHoming(int a) {
         s->setCurrentPosition(0);
         applyAxisSpeed(a, cfg[a].runSpeed);
         s->moveTo(-cfg[a].homeDir * (int32_t)cfg[a].workOffset);
+        setCmdTarget(a, -cfg[a].homeDir * (int32_t)cfg[a].workOffset);
         st[a].moveMs = millis();
         st[a].isHomed = true;
         st[a].home = H_DONE;
@@ -650,13 +696,21 @@ static inline bool limitsActive(int a) {
   return cfg[a].limitMaxMm > cfg[a].limitMinMm;
 }
 
-// A soft limit only means anything against a known reference. Before homing,
-// position 0 is wherever the board happened to power up, so the limits would
-// clamp against nothing - and an unhomed axis has to be free to move or it
-// could never be homed at all. Homing itself drives the stepper directly and
-// never comes through here.
+// A soft limit is measured from a zero, and this axis has one of three: the
+// power-on zero (setCurrentPosition(0) in setup), a Z, or a completed home.
+// Only the last two are surveyed against a hard stop - after power-on, zero is
+// just wherever the board booted. An un-surveyed window is still worth
+// enforcing though: it keeps a jog or an M from running the axis clean off the
+// end, which is exactly what used to happen before the axis was homed, or
+// after a fault / sync-loss / disable cleared isHomed. So the window is
+// APPROXIMATE until the axis is homed or zeroed - never absent.
+//
+// This cannot trap an un-homed axis. Homing drives the stepper directly and
+// never comes through here, so H always reaches the stop. To reach a spot
+// outside the power-on window by hand first, Z the axis there to set a fresh
+// zero.
 static long clampToLimits(int a, long target) {
-  if (!limitsActive(a) || !st[a].isHomed) return target;
+  if (!limitsActive(a)) return target;
   long lo = mmToSteps(a, cfg[a].limitMinMm);
   long hi = mmToSteps(a, cfg[a].limitMaxMm);
   if (target < lo) return lo;
@@ -664,26 +718,35 @@ static long clampToLimits(int a, long target) {
   return target;
 }
 
-// Where the last accepted command aims each axis. The library cannot answer
-// this: getPositionAfterCommandsCompleted() reports the end of the step
-// QUEUE, which is a few milliseconds of steps, not the end of the ramp. Ask
-// it where a move will finish and it answers with roughly the current
-// position, so a burst of jogs each measured its delta from where the axis
-// happened to be and stacked straight through the limit.
-static long cmdTarget[NUM_AXES] = { 0, 0, 0, 0 };
+// cmdTarget[] / cmdTargetMs[] are declared up with the other globals. The
+// library cannot stand in for cmdTarget: getPositionAfterCommandsCompleted()
+// reports the end of the step QUEUE, a few milliseconds of steps, not the end
+// of the ramp, so a burst of jogs read off it each measured its delta from
+// wherever the axis happened to be and stacked straight through the limit.
+//
+// getCurrentPosition() has the opposite failure during a burst. A jog can
+// arrive before FastAccelStepper has flipped isRunning() true (the same lag
+// MOVE_SETTLE_MS covers in homing), and in that gap the axis still reads its
+// old position. Re-syncing cmdTarget from it there throws the accumulated
+// target away on every keystroke, so a held jog key walks the axis one
+// un-counted press at a time - past the soft limit if it is sitting on one.
+// So reconcile with the hardware ONLY once the axis has actually settled;
+// until then cmdTarget is the authority and the limit is tested against it.
+static void syncTargetIfSettled(int a) {
+  if (!stepper[a]->isRunning() && millis() - cmdTargetMs[a] > MOVE_SETTLE_MS)
+    cmdTarget[a] = stepper[a]->getCurrentPosition();
+}
 
 // Everything goes out as an absolute moveTo against a target this file owns,
-// so no relative-move bookkeeping inside the library can be raced. The
-// re-sync matters because a stopped axis may have been moved by something
-// that never came through here - homing, S, a fault, e-stop, Z.
+// so no relative-move bookkeeping inside the library can be raced.
 static void issueMove(int a, long v, bool absolute) {
   if (!stepper[a]) return;
-  if (!stepper[a]->isRunning()) cmdTarget[a] = stepper[a]->getCurrentPosition();
+  syncTargetIfSettled(a);
 
   long target = clampToLimits(a, absolute ? v : cmdTarget[a] + v);
   applyAxisSpeed(a, cfg[a].runSpeed);
   stepper[a]->moveTo(target);
-  cmdTarget[a] = target;
+  setCmdTarget(a, target);
 }
 
 // Clamped once, against the commanding axis, and the SAME adjustment goes to
@@ -696,15 +759,15 @@ static void issueMove(int a, long v, bool absolute) {
 // or stacked jogs would walk straight through it.
 static void commandMove(int a, long v, bool absolute) {
   if (!stepper[a]) return;
-  if (!stepper[a]->isRunning()) cmdTarget[a] = stepper[a]->getCurrentPosition();
+  syncTargetIfSettled(a);
 
   long want    = absolute ? v : cmdTarget[a] + v;
   long clamped = clampToLimits(a, want);
 
   if (clamped != want)
-    outf("# axis %d limited to %ld steps (travel %ld to %ld mm = %ld to %ld steps)",
-         a + 1, clamped, (long)cfg[a].limitMinMm, (long)cfg[a].limitMaxMm,
-         mmToSteps(a, cfg[a].limitMinMm), mmToSteps(a, cfg[a].limitMaxMm));
+    outf("# axis %d limited to %ld steps (%s window, travel %ld to %ld mm)",
+         a + 1, clamped, st[a].isHomed ? "homed" : "power-on",
+         (long)cfg[a].limitMinMm, (long)cfg[a].limitMaxMm);
 
   if (absolute) {
     issueMove(a, clamped, true);
@@ -723,6 +786,7 @@ static void zeroOne(int a) {
   if (!stepper[a]) return;
   stepper[a]->setCurrentPosition(0);
   if (hasEncoder(a)) encoder[a].setCount(0);
+  setCmdTarget(a, 0);
   st[a].isHomed  = true;
   st[a].home     = H_IDLE;
   st[a].fault[0] = '\0';
@@ -802,12 +866,14 @@ static void saveConfig(int a) {
 static void saveMachine() {
   prefs.begin("axes", false);
   prefs.putUInt("idle", idleTimeoutS);
+  prefs.putBool("faultkill", faultKillsDrives);
   prefs.end();
 }
 
 static void loadConfig() {
   prefs.begin("axes", true);
   idleTimeoutS = prefs.getUInt("idle", 300);
+  faultKillsDrives = prefs.getBool("faultkill", true);   // default on
   for (int a = 0; a < NUM_AXES; a++) {
     char key[16];
     snprintf(key, sizeof(key), "a%d", a);
@@ -828,6 +894,7 @@ static void emitStatus() {
   j += estopActive ? "true" : "false";
   j += ",\"drives\":";  j += drivesEnabled ? "true" : "false";
   j += ",\"idle\":";    j += idleTimeoutS;
+  j += ",\"fdrop\":";   j += faultKillsDrives ? "true" : "false";
   j += ",\"axis\":[";
   for (int a = 0; a < NUM_AXES; a++) {
     if (a) j += ',';
@@ -857,10 +924,11 @@ static void emitStatus() {
     j += ",\"eni\":";  j += cfg[a].enaInvert;
     j += ",\"ihold\":"; j += cfg[a].idleHold;
     j += "}";
-    // Outside "c" because it is not a setting - it is whether the settings
-    // are biting right now. A limit on an unhomed axis is not enforced, and
-    // that is worth seeing rather than guessing at.
-    j += ",\"lim\":"; j += (limitsActive(a) && st[a].isHomed) ? "true" : "false";
+    // Outside "c" because it is not a setting - it is whether a limit is
+    // configured for this axis at all. When true it is always enforced;
+    // before the axis is homed or zeroed the window is measured from the
+    // power-on position, which "state" (idle vs homed) tells apart.
+    j += ",\"lim\":"; j += limitsActive(a) ? "true" : "false";
     j += "}";
   }
   j += "]}";
@@ -880,13 +948,15 @@ static void printHelp() {
   outLine("#   S                    stop all motion");
   outLine("#   EN 1 | EN 0          energise / release all drives (EN alone reports)");
   outLine("#   IDLE <sec>           drop the drives after this long unmoving, 0 = never");
-  outLine("#   E 1 | E 0            engage / release e-stop");
+  outLine("#   FD 1 | FD 0          fault-drop: release all drives on any fault (default on)");
+  outLine("#   E 1 | E 0            engage / release e-stop (E 1 also cuts drives; EN 1 after E 0)");
   outLine("#   C <axis> <key> <val> set config, then saved to flash");
   outLine("#     keys: run acc hs hss ppr cpr thr bo wo mt dir inv he");
   outLine("#           spm lmin lmax eni ihold");
   outLine("#     spm = steps per metre; lmin/lmax = soft travel limits in mm");
   outLine("#     (the GUI takes those as cm). lmax <= lmin turns the limit");
-  outLine("#     off, and limits only apply once the axis is homed.");
+  outLine("#     off. Limits are always enforced; until the axis is homed or");
+  outLine("#     zeroed the window is measured from the power-on position.");
   outLine("#     eni = 1 if a conducting ENA input ENABLES that drive;");
   outLine("#     ihold = 1 keeps the axis live through the idle timeout");
   outLine("#     run acc hs hss bo wo mt dir he spm lmin lmax eni ihold mirror");
@@ -992,8 +1062,17 @@ static void execLine(String line) {
   if (cmd == "E") {
     bool set = (n > 1) ? (tok[1].toInt() != 0) : true;
     estopActive = set;
-    if (set) stopAll();
-    outf("# e-stop %s", set ? "ENGAGED" : "released");
+    if (set) {
+      // An e-stop cuts motor power, it does not just refuse new commands.
+      // killDrives() halts everything and releases every axis, idleHold
+      // included - the same as a hardware e-stop in the motor supply.
+      // drivesEnabled is left off: releasing the e-stop does NOT re-energise
+      // (EN 1 is blocked until E 0), so the drives come back only when asked.
+      killDrives();
+      outLine("# e-stop ENGAGED - motion stopped, drives OFF");
+    } else {
+      outLine("# e-stop released - drives still OFF, EN 1 to re-energise");
+    }
     return;
   }
 
@@ -1006,6 +1085,17 @@ static void execLine(String line) {
       outLine("# blocked: e-stop engaged"); return;
     }
     setDrives(tok[1].toInt() != 0, false);
+    return;
+  }
+
+  // FD 1 | FD 0 - fault-drop safety switch. On (the default), any axis fault
+  // releases every drive, the same as E 1. Off, a fault still stops motion and
+  // latches the axis but leaves the drives energised. Persisted.
+  if (cmd == "FD") {
+    if (n < 2) { outf("# fault-drop %s", faultKillsDrives ? "ON" : "off"); return; }
+    faultKillsDrives = (tok[1].toInt() != 0);
+    saveMachine();
+    outf("# fault-drop %s (saved)", faultKillsDrives ? "ON" : "off");
     return;
   }
 
@@ -1072,11 +1162,18 @@ static void execLine(String line) {
     if (!drivesEnabled) { outf("# axis %d: cannot test, drives disabled", a + 1); return; }
 
     // 200 steps at 200 Hz is one full second of stepping - slow enough to
-    // watch the shaft and to meter the pulse line by hand.
-    int32_t p0 = stepper[a]->getCurrentPosition();
+    // watch the shaft and to meter the pulse line by hand. Clamp it to the
+    // soft limit like any other move, and bail if there is no room, so the
+    // self-test can never be the thing that drives an axis off the end.
+    int32_t p0    = stepper[a]->getCurrentPosition();
+    long    probe = clampToLimits(a, (long)p0 + 200);
+    if (probe == p0) {
+      outf("# axis %d: on the soft limit, no room for the self-test step", a + 1);
+      return;
+    }
     stepper[a]->setSpeedInHz(200);
     stepper[a]->setAcceleration(1000);
-    stepper[a]->move(200);
+    stepper[a]->moveTo(probe);
     uint32_t t0 = millis();
     while (stepper[a]->isRunning() && millis() - t0 < 4000) {
       if (wifiUp) ws.loop();     // keep the heartbeat alive across the wait
@@ -1084,6 +1181,7 @@ static void execLine(String line) {
     }
     int32_t p1 = stepper[a]->getCurrentPosition();
     applyAxisSpeed(a, cfg[a].runSpeed);        // put the working speed back
+    setCmdTarget(a, p1);                       // shadow follows the probe move
 
     outf("# axis %d: commanded 200, position moved %ld in %lu ms",
          a + 1, (long)(p1 - p0), (unsigned long)(millis() - t0));
@@ -1206,9 +1304,11 @@ static void setupNetwork() {
     // direction with nothing servicing the step line. E-stop is engaged to
     // block anything arriving during the transfer, not to persist - the
     // reboot clears it, and it clears isHomed with it. Re-home after OTA.
-    stopAll();
+    // Drop the drives too, same as the E command: nothing should be
+    // energised through a reflash.
+    killDrives();
     estopActive = true;
-    Serial.println("# OTA starting - motion stopped, re-home after reboot");
+    Serial.println("# OTA starting - motion stopped, drives OFF, re-home after reboot");
   });
   ArduinoOTA.onError([](ota_error_t e) { Serial.printf("# OTA error %u\n", e); });
   ArduinoOTA.begin();

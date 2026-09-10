@@ -27,7 +27,7 @@
   .link{font-size:10px;color:var(--dim);letter-spacing:.5px;margin-right:4px}
   .go{background:#243a4d;border-color:#2f5570}
   .conn{background:#1d3a2e;border-color:#2c5a45}
-  .drv.off{background:#4a2220;border-color:#8f3330;color:#ffb4b0}
+  .off{background:#4a2220;border-color:#8f3330;color:#ffb4b0}
   .num{background:#14171c;color:var(--ink);border:1px solid var(--line);
        border-radius:4px;padding:5px 7px;font:inherit;font-size:12px;width:64px}
   .dot{width:9px;height:9px;border-radius:50%;background:#555;display:inline-block}
@@ -132,6 +132,8 @@
          title="minutes with no movement before the drives are released; 0 = never">
   <span class="tag">MIN</span>
   <button onclick="applyIdle()">SET</button>
+  <button class="go" id="fd" onclick="toggleFaultDrop()"
+          title="when on, any axis fault releases every drive (like E-STOP)">FAULT-DROP</button>
 </div>
 
 <div class="cmdbar">
@@ -196,6 +198,7 @@ let lastStatus = null;       // most recent status object, for the backup file
 let drvOn = true;            // last reported ENA state, machine wide
 let sel = CARDS.map(()=>200);
 let esOn = false;
+let fdOn = true;             // last reported fault-drop switch state
 // One command path at a time. USB and WiFi reach the same parser on the
 // board, so opening the second closes the first: two operators on two
 // links with no sight of each other is a bad way to run a machine.
@@ -408,6 +411,7 @@ async function loadCfgFile(input){
 // board's last report, and over a link that can drop, a toggle computed at
 // this end is how a machine gets energised while nobody is looking.
 function toggleDrives(){ send(`EN ${drvOn ? 0 : 1}`); }
+function toggleFaultDrop(){ send(`FD ${fdOn ? 0 : 1}`); }
 
 function applyIdle(){
   const e = document.getElementById('idleMin');
@@ -632,6 +636,11 @@ function apply(d){
   db.className = 'go drv' + (drvOn ? '' : ' off');
   if(!cfgLoaded && d.idle !== undefined)
     document.getElementById('idleMin').value = d.idle / 60;
+
+  if(d.fdrop !== undefined) fdOn = d.fdrop;
+  const fb = document.getElementById('fd');
+  fb.textContent = fdOn ? 'FAULT-DROP ON' : 'FAULT-DROP OFF';
+  fb.className = 'go' + (fdOn ? '' : ' off');
 
   esOn = d.estop;
   document.getElementById('banner').className = 'banner'+(esOn?' on':'');
