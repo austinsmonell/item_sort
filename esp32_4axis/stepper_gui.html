@@ -8,11 +8,18 @@
     --dim:#8a919d; --accent:#4a9eda; --ok:#3fa87a; --bad:#d9534f;
   }
   *{box-sizing:border-box}
+  html,body{height:100%}
   body{margin:0;background:var(--bg);color:var(--ink);
-       font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
-  header{position:sticky;top:0;z-index:10;background:var(--panel);
+       font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+       display:flex;flex-direction:column}
+  header{flex:none;z-index:10;background:var(--panel);
          border-bottom:2px solid var(--line);padding:10px 14px;
          display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  /* one scrolling region between the header and the always-visible log -
+     CONTROL can outgrow it and scroll, GANTRY sizes itself to fit inside it */
+  #content{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column}
+  #pageControl{flex:none}
+  .cmdbar,#log{flex:none}
   h1{font-size:15px;margin:0;font-weight:700;letter-spacing:.4px}
   .spacer{flex:1}
   button{font:inherit;color:var(--ink);background:#272b33;border:1px solid var(--line);
@@ -25,6 +32,10 @@
   .host{background:#14171c;color:var(--ink);border:1px solid var(--line);
         border-radius:4px;padding:5px 7px;font:inherit;font-size:12px;width:130px}
   .link{font-size:10px;color:var(--dim);letter-spacing:.5px;margin-right:4px}
+  .tabs{display:flex;gap:6px}
+  .tabs button{padding:8px 12px;font-size:12px}
+  .tabs button.sel{background:var(--accent);border-color:var(--accent);color:#08121b;font-weight:700}
+  [hidden]{display:none!important}
   .go{background:#243a4d;border-color:#2f5570}
   .conn{background:#1d3a2e;border-color:#2c5a45}
   .off{background:#4a2220;border-color:#8f3330;color:#ffb4b0}
@@ -87,8 +98,51 @@
   .cmdbar input{flex:1;background:#0f1115;color:var(--ink);border:1px solid var(--line);
         border-radius:6px;padding:9px 11px;font:inherit;font-size:12px}
   .cmdbar input:focus{outline:none;border-color:var(--accent)}
-  #log{margin:0 14px 20px;background:#0f1115;border:1px solid var(--line);border-radius:6px;
-       padding:10px;height:150px;overflow:auto;font-size:11px;color:var(--dim);white-space:pre-wrap}
+  #log{margin:0 14px 10px;background:#0f1115;border:1px solid var(--line);border-radius:6px;
+       padding:10px;height:100px;overflow:auto;font-size:11px;color:var(--dim);white-space:pre-wrap}
+
+  /* ---- gantry view tab ---- */
+  #pageGantry{flex:1;min-height:0;display:flex;flex-direction:column}
+  .gwrap{padding:10px 14px;display:grid;gap:14px;grid-template-columns:1fr 220px;
+         min-height:0;flex:1}
+  @media (max-width:760px){ .gwrap{grid-template-columns:1fr;overflow:auto} }
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:7px;overflow:hidden;
+         display:flex;flex-direction:column;min-height:0}
+  .panel h2{margin:0;padding:9px 12px;font-size:13px;background:#232730;
+           border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;flex:none}
+  .panel .body{padding:12px;min-height:0;flex:1;display:flex;flex-direction:column}
+  #hoverCoord{min-width:78px;text-align:center;font-variant-numeric:tabular-nums}
+  /* the svg's own preserveAspectRatio keeps the square work-area from
+     distorting even though this box is free to be any shape */
+  #plan{flex:1;min-height:0;width:100%;display:block;background:#0f1115;border-radius:5px;
+        cursor:crosshair;touch-action:none}
+  #plan.locked{cursor:not-allowed}
+  .readout{display:grid;grid-template-columns:1fr auto;gap:2px 10px;font-size:12px;margin-bottom:10px}
+  .readout .k{color:var(--dim)}
+  .readout .v{font-variant-numeric:tabular-nums;font-weight:700}
+  .gwrap .goto{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0}
+  .gwrap .goto input{background:#14171c;color:var(--ink);border:1px solid var(--line);
+              border-radius:5px;padding:8px;font:inherit;width:100%}
+  .gwrap .goto input:focus{outline:none;border-color:var(--accent)}
+  .gwrap .goto button{grid-column:1 / span 2}
+  .zwrap{display:flex;flex-direction:column;align-items:center;gap:8px;flex:1;min-height:0;justify-content:center}
+  .zstrip{position:relative;width:44px;height:min(240px,32vh);background:#0f1115;border-radius:5px;
+          cursor:pointer;touch-action:none}
+  .zstrip.locked{cursor:not-allowed}
+  .zfill{position:absolute;left:3px;right:3px;bottom:3px;background:#243a4d;border-radius:3px;
+         transition:height .12s}
+  .zcur{position:absolute;left:0;right:0;height:2px;background:var(--accent)}
+  .ztarget{position:absolute;left:0;right:0;height:2px;background:#e0a080;border-top:1px dashed #e0a080}
+  .zhover{position:absolute;left:0;right:0;height:1px;background:var(--ink);opacity:.6;pointer-events:none}
+  .zlabel{position:absolute;right:100%;margin-right:4px;font-size:10px;color:var(--dim);
+          transform:translateY(-50%);white-space:nowrap}
+  .zlabel-hover{color:var(--ink);font-weight:700;pointer-events:none}
+  .znudge{display:flex;gap:6px}
+  .znudge button{padding:6px 10px;font-size:12px}
+  .legend{display:flex;gap:12px;font-size:11px;color:var(--dim);margin-top:8px;flex-wrap:wrap;flex:none}
+  .swatch{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px;vertical-align:middle}
+  .sw-cur{background:var(--accent)}
+  .sw-tgt{background:#e0a080;border:1px solid #e0a080;background-clip:padding-box}
 </style></head><body>
 
 <header>
@@ -96,6 +150,10 @@
   <span class="dot" id="dot"></span>
   <span class="link" id="link"></span>
   <span class="spacer"></span>
+  <div class="tabs">
+    <button class="sel" id="tabControl" onclick="showPage('control')">CONTROL</button>
+    <button id="tabGantry" onclick="showPage('gantry')">GANTRY VIEW</button>
+  </div>
   <input id="host" class="host" placeholder="stepper.local" title="board hostname or IP">
   <button class="conn" id="btnWifi" onclick="connectWifi()">WIFI</button>
   <button class="conn" id="btnConn" onclick="connect()">USB</button>
@@ -118,22 +176,84 @@
   Close the Arduino Serial Monitor first, or the port will be busy.
 </div>
 
-<div class="wrap" id="axes"></div>
+<div id="content">
+<div id="pageControl">
+  <div class="wrap" id="axes"></div>
 
-<div class="cfgbar">
-  <span class="tag">CONFIG BACKUP</span>
-  <button onclick="saveCfgFile()">SAVE TO FILE</button>
-  <button onclick="document.getElementById('cfgFile').click()">LOAD FROM FILE</button>
-  <input type="file" id="cfgFile" accept=".json,application/json" hidden
-         onchange="loadCfgFile(this)">
-  <span class="spacer"></span>
-  <span class="tag">IDLE DISABLE</span>
-  <input id="idleMin" class="num" type="number" min="0" step="0.5"
-         title="minutes with no movement before the drives are released; 0 = never">
-  <span class="tag">MIN</span>
-  <button onclick="applyIdle()">SET</button>
-  <button class="go" id="fd" onclick="toggleFaultDrop()"
-          title="when on, any axis fault releases every drive (like E-STOP)">FAULT-DROP</button>
+  <div class="cfgbar">
+    <span class="tag">CONFIG BACKUP</span>
+    <button onclick="saveCfgFile()">SAVE TO FILE</button>
+    <button onclick="document.getElementById('cfgFile').click()">LOAD FROM FILE</button>
+    <input type="file" id="cfgFile" accept=".json,application/json" hidden
+           onchange="loadCfgFile(this)">
+    <span class="spacer"></span>
+    <span class="tag">IDLE DISABLE</span>
+    <input id="idleMin" class="num" type="number" min="0" step="0.5"
+           title="minutes with no movement before the drives are released; 0 = never">
+    <span class="tag">MIN</span>
+    <button onclick="applyIdle()">SET</button>
+    <button class="go" id="fd" onclick="toggleFaultDrop()"
+            title="when on, any axis fault releases every drive (like E-STOP)">FAULT-DROP</button>
+  </div>
+</div>
+
+<div id="pageGantry" hidden>
+  <div class="gwrap">
+    <div class="panel">
+      <h2>WORK AREA (TOP VIEW)<span class="tag">X: axis 3 &middot; Y: axis 1+2 gantry</span>
+        <span style="flex:1"></span>
+        <span class="tag" id="hoverCoord"></span>
+        <span class="state" id="scXY">--</span>
+      </h2>
+      <div class="body">
+        <svg id="plan" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet"></svg>
+        <div class="legend">
+          <span><span class="swatch sw-cur"></span>current position</span>
+          <span><span class="swatch sw-tgt"></span>target &middot; snaps to the nearest cm</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>POSITION</h2>
+      <div class="body">
+        <div class="readout">
+          <span class="k">X (cm)</span><span class="v" id="rx">--</span>
+          <span class="k">Y (cm)</span><span class="v" id="ry">--</span>
+          <span class="k">Z (cm)</span><span class="v" id="rz">--</span>
+        </div>
+        <div class="goto">
+          <input id="gxx" type="number" step="1" placeholder="X cm">
+          <input id="gyy" type="number" step="1" placeholder="Y cm">
+          <button onclick="gotoXY()">GO TO X,Y</button>
+        </div>
+
+        <div class="zwrap">
+          <span class="tag">Z &middot; axis 4</span>
+          <div class="zstrip" id="zstrip" onclick="zClick(event)">
+            <div class="zfill" id="zfill" style="height:0"></div>
+            <div class="zcur" id="zcur" style="bottom:0"></div>
+            <div class="ztarget" id="ztarget" style="display:none"></div>
+            <div class="zhover" id="zhover" style="display:none"></div>
+            <span class="zlabel" id="zlabelMax" style="top:0"></span>
+            <span class="zlabel" id="zlabelMin" style="top:100%"></span>
+            <span class="zlabel zlabel-hover" id="zlabelHover" style="display:none"></span>
+          </div>
+          <div class="hint">hover to preview, click to go there</div>
+          <div class="goto" style="grid-template-columns:1fr;width:100%">
+            <input id="gzz" type="number" step="0.1" placeholder="Z cm">
+            <button onclick="gotoZ()">GO TO Z</button>
+          </div>
+          <div class="znudge">
+            <button onclick="nudgeZ(-1)">Z &minus;</button>
+            <button onclick="nudgeZ(1)">Z +</button>
+          </div>
+          <span class="state" id="scZ">--</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 </div>
 
 <div class="cmdbar">
@@ -707,7 +827,470 @@ function apply(d){
   const g = CARDS[0].motors;
   txt('skew', d.axis[g[0]].enc - d.axis[g[1]].enc);
 
+  const xyState = cardState([d.axis[AXV.x], d.axis[AXV.y], d.axis[PARTNER_Y]]);
+  const scxy = document.getElementById('scXY');
+  scxy.textContent = xyState.state;
+  scxy.className = stateClass(xyState.state, xyState.moving);
+  const zState = d.axis[AXV.z];
+  const scz = document.getElementById('scZ');
+  scz.textContent = zState.state;
+  scz.className = stateClass(zState.state, zState.moving);
+
   cfgLoaded = true;
+
+  // Once a click-to-move target is reached, stop showing it as pending.
+  if(planTarget){
+    const xcm = stepsToCm(AXV.x, d.axis[AXV.x].pos);
+    const ycm = stepsToCm(AXV.y, d.axis[AXV.y].pos);
+    if(d.axis[AXV.x].state==='homed' && d.axis[AXV.y].state==='homed'
+       && !d.axis[AXV.x].moving && !d.axis[AXV.y].moving
+       && Math.abs((xcm??0)-planTarget.x) < 0.2 && Math.abs((ycm??0)-planTarget.y) < 0.2){
+      planTarget = null;
+    }
+  }
+  if(zTargetCm !== null){
+    const zcm = stepsToCm(AXV.z, d.axis[AXV.z].pos);
+    if(d.axis[AXV.z].state==='homed' && !d.axis[AXV.z].moving
+       && Math.abs((zcm??0)-zTargetCm) < 0.2){
+      zTargetCm = null;
+    }
+  }
+
+  drawPlan();
+  drawZ();
+}
+
+// =====================================================================
+// Gantry view tab. Same connection, same status stream as the control
+// tab - no separate page, so switching tabs never touches the WiFi or
+// USB link. AX/CMD read the same CARDS mapping the control tab uses:
+// the gantry pair (axis 1+2) is the rail the gantry rides on (Y), axis 3
+// crosses it (X), axis 4 lifts (Z).
+// =====================================================================
+const AXV = { x:2, y:0, z:3 };     // status.axis[] indices (0-based)
+const CMDV = { x:3, y:1, z:4 };    // command numbers the firmware expects
+const PARTNER_Y = 1;               // axis 1's mirrored partner
+
+let planTarget = null;   // {x,y} cm, snapped to whole cm, or null
+let zTargetCm = null;    // pending Z target, cm, or null
+let hoverCm = null;      // {x,y} cm under the pointer in the plan, or null
+let zHoverCm = null;     // cm under the pointer on the Z strip, or null
+
+function showPage(name){
+  document.getElementById('pageControl').hidden = name !== 'control';
+  document.getElementById('pageGantry').hidden  = name !== 'gantry';
+  document.getElementById('tabControl').classList.toggle('sel', name==='control');
+  document.getElementById('tabGantry').classList.toggle('sel', name==='gantry');
+  if(name === 'gantry'){ drawPlan(); drawZ(); }
+}
+
+function cmToSteps(axisIdx, cm){
+  const spm = lastStatus.axis[axisIdx].c.spm;
+  return spm ? Math.round(cm * spm / 100) : null;
+}
+function stepsToCm(axisIdx, steps){
+  const spm = lastStatus.axis[axisIdx].c.spm;
+  return spm ? steps * 100 / spm : null;
+}
+function limitsCm(axisIdx){
+  if(!lastStatus) return null;
+  const c = lastStatus.axis[axisIdx].c;
+  if(!(c.lmax > c.lmin)) return null;      // no limit configured
+  return [c.lmin/10, c.lmax/10];
+}
+// The firmware itself never requires an axis to be homed before J/M - see
+// commandMove() in the .ino, which only checks the e-stop and drive-enable
+// flags plus busyHoming(). Axis 4 in particular has no homing sequence at
+// all (homeEnable 0 by default) and would never satisfy a "homed" gate, so
+// this mirrors the firmware's own rule instead of inventing a stricter one.
+const HOMING_STATES = ['approach','touch','backoff','precise','touch2','offset','blind'];
+
+// Every click or GO TO ends in either a command going out or a specific,
+// visible reason why not - a silent no-op is what "the view doesn't
+// respond" looks like from the operator's chair, so nothing here is allowed
+// to just `return` quietly.
+function moveBlockReason(specs){
+  if(!lastStatus) return 'not connected';
+  if(esOn) return 'e-stop engaged';
+  if(!drvOn) return 'drives off';
+  for(const {idx,label} of specs){
+    const s = lastStatus.axis[idx].state;
+    if(s === 'FAULT') return `${label} faulted - clear it before moving`;
+    if(HOMING_STATES.includes(s)) return `${label} mid-home (${s})`;
+  }
+  return null;
+}
+function readyToMove(axisIdxs){
+  return !moveBlockReason(axisIdxs.map(idx=>({idx,label:'axis'})));
+}
+const XY_SPECS = [ {idx:AXV.x, label:'X (axis 3)'},
+                   {idx:AXV.y, label:'Y (axis 1)'},
+                   {idx:PARTNER_Y, label:'Y (axis 2)'} ];
+const Z_SPECS  = [ {idx:AXV.z, label:'Z (axis 4)'} ];
+
+// ---------------------------------------------------------------- plan (XY)
+const PLAN_PAD = 12;   // svg units - leaves room for the tick labels
+
+function planBounds(){
+  const lx = limitsCm(AXV.x), ly = limitsCm(AXV.y);
+  if(!lx || !ly) return null;
+  return { xmin:lx[0], xmax:lx[1], ymin:ly[0], ymax:ly[1] };
+}
+function planXY(b, xcm, ycm){
+  // Y grows toward the front of the screen the same way it grows on the
+  // machine's own axis, but SVG y grows downward - flip it so "up" on
+  // screen is the direction Y actually increases in.
+  const px = PLAN_PAD + (xcm - b.xmin) / (b.xmax - b.xmin) * (100 - 2*PLAN_PAD);
+  const py = (100 - PLAN_PAD) - (ycm - b.ymin) / (b.ymax - b.ymin) * (100 - 2*PLAN_PAD);
+  return [px, py];
+}
+function planInverse(b, px, py){
+  const xcm = b.xmin + (px - PLAN_PAD) / (100 - 2*PLAN_PAD) * (b.xmax - b.xmin);
+  const ycm = b.ymin + ((100 - PLAN_PAD) - py) / (100 - 2*PLAN_PAD) * (b.ymax - b.ymin);
+  return [xcm, ycm];
+}
+// A round-number step for gridlines/ticks - 1, 2 or 5 x a power of ten,
+// picked so there are roughly 6-10 of them across the longer side.
+function niceStep(range){
+  const raw = range / 8;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw || 1)));
+  const norm = raw / mag;
+  const mult = norm < 1.5 ? 1 : norm < 3.5 ? 2 : norm < 7.5 ? 5 : 10;
+  return Math.max(1, mult * mag);
+}
+
+// The plan used to be redrawn by replacing the SVG's whole innerHTML on
+// every mousemove and every ~250ms status tick. That destroys and recreates
+// every child node each time - and if a mousedown lands on a node that gets
+// torn down before the matching mouseup, the browser drops the click
+// entirely (a well-known DOM quirk: removing the target between mousedown
+// and mouseup suppresses the click event). That was the "have to click
+// several times" bug. Fixed by building the SVG's children exactly once and
+// only ever updating their attributes afterward - no node a click could be
+// mid-gesture on is ever removed. Every non-frame element also carries
+// pointer-events="none" so a click always hits the (equally permanent)
+// frame rect, never a 1px marker line.
+const NS = 'http://www.w3.org/2000/svg';
+let planEls = null;
+let planGridKey = null;
+
+function svgEl(tag, attrs){
+  const el = document.createElementNS(NS, tag);
+  for(const k in attrs) el.setAttribute(k, attrs[k]);
+  return el;
+}
+function show(el){ el.style.display = ''; }
+function hide(el){ el.style.display = 'none'; }
+function setLine(el,x1,y1,x2,y2){
+  el.setAttribute('x1',x1); el.setAttribute('y1',y1);
+  el.setAttribute('x2',x2); el.setAttribute('y2',y2);
+}
+// A small "(x, y)" label offset from a marker, flipped near the plan's
+// edges so it never runs off the canvas.
+function positionLabel(el, px, py, text){
+  const dx = px > 100-PLAN_PAD-14 ? -3 : 3;
+  const dy = py < PLAN_PAD+8 ? 6 : -3;
+  el.setAttribute('x', px+dx);
+  el.setAttribute('y', py+dy);
+  el.setAttribute('text-anchor', dx<0 ? 'end' : 'start');
+  el.textContent = text;
+}
+
+function ensurePlanEls(){
+  if(planEls) return planEls;
+  const svg = document.getElementById('plan');
+  const frame     = svgEl('rect', {x:PLAN_PAD,y:PLAN_PAD,width:100-2*PLAN_PAD,height:100-2*PLAN_PAD,
+                                    fill:'none',stroke:'#2c313a','stroke-width':0.6});
+  const gridGroup = svgEl('g', {});
+  const axisLabelX = svgEl('text', {x:50,y:99,'font-size':3.4,fill:'#8a919d','text-anchor':'middle'});
+  axisLabelX.textContent = 'X (cm)';
+  const axisLabelY = svgEl('text', {x:3,y:50,'font-size':3.4,fill:'#8a919d','text-anchor':'middle',
+                                     transform:'rotate(-90 3 50)'});
+  axisLabelY.textContent = 'Y (cm)';
+  const curLineH = svgEl('line', {stroke:'#4a9eda','stroke-width':0.6});
+  const curLineV = svgEl('line', {stroke:'#4a9eda','stroke-width':0.6});
+  const curDot   = svgEl('circle', {r:1.8, fill:'#4a9eda'});
+  const tgtCircle = svgEl('circle', {r:2.4, fill:'none', stroke:'#e0a080','stroke-width':0.7,
+                                      'stroke-dasharray':'1.5,1'});
+  const tgtLabel  = svgEl('text', {'font-size':3.6, fill:'#e0a080', stroke:'#0f1115',
+                                    'stroke-width':0.6, style:'paint-order:stroke'});
+  const hovLineH = svgEl('line', {stroke:'#e8eaed','stroke-width':0.25,'stroke-dasharray':'0.8,0.8',opacity:0.5});
+  const hovLineV = svgEl('line', {stroke:'#e8eaed','stroke-width':0.25,'stroke-dasharray':'0.8,0.8',opacity:0.5});
+  const hovDot   = svgEl('circle', {r:1, fill:'#e8eaed'});
+  const hovLabel = svgEl('text', {'font-size':3.6, fill:'#e8eaed', stroke:'#0f1115',
+                                   'stroke-width':0.6, style:'paint-order:stroke'});
+  const msgText  = svgEl('text', {x:50,y:50,'font-size':5,fill:'#8a919d','text-anchor':'middle'});
+
+  [gridGroup, axisLabelX, axisLabelY, curLineH, curLineV, curDot,
+   tgtCircle, tgtLabel, hovLineH, hovLineV, hovDot, hovLabel, msgText]
+    .forEach(el => el.setAttribute('pointer-events','none'));
+
+  svg.append(frame, gridGroup, axisLabelX, axisLabelY,
+             curLineH, curLineV, curDot, tgtCircle, tgtLabel,
+             hovLineH, hovLineV, hovDot, hovLabel, msgText);
+
+  planEls = { svg, frame, gridGroup, axisLabelX, axisLabelY,
+              curLineH, curLineV, curDot, tgtCircle, tgtLabel,
+              hovLineH, hovLineV, hovDot, hovLabel, msgText };
+  return planEls;
+}
+
+function drawPlan(){
+  if(document.getElementById('pageGantry').hidden) return;
+  const els = ensurePlanEls();
+  const b = planBounds();
+  els.svg.classList.toggle('locked', !readyToMove([AXV.x, AXV.y, PARTNER_Y]));
+
+  if(!b){
+    hide(els.frame); hide(els.gridGroup); hide(els.axisLabelX); hide(els.axisLabelY);
+    hide(els.curLineH); hide(els.curLineV); hide(els.curDot);
+    hide(els.tgtCircle); hide(els.tgtLabel);
+    hide(els.hovLineH); hide(els.hovLineV); hide(els.hovDot); hide(els.hovLabel);
+    els.msgText.textContent = 'no travel limits configured yet';
+    show(els.msgText);
+    return;
+  }
+  hide(els.msgText);
+  show(els.frame); show(els.axisLabelX); show(els.axisLabelY);
+
+  const step = niceStep(Math.max(b.xmax-b.xmin, b.ymax-b.ymin));
+  const gridKey = `${b.xmin},${b.xmax},${b.ymin},${b.ymax},${step}`;
+  if(gridKey !== planGridKey){
+    planGridKey = gridKey;
+    // The grid only needs rebuilding when the travel window actually
+    // changes (rare) - and even then, only gridGroup's own inert
+    // (pointer-events:none) children are replaced, never gridGroup itself.
+    let gs = '';
+    for(let x = Math.ceil(b.xmin/step)*step; x <= b.xmax; x += step){
+      const [px] = planXY(b, x, b.ymin);
+      gs += `<line x1="${px}" y1="${PLAN_PAD}" x2="${px}" y2="${100-PLAN_PAD}"
+                stroke="#20242c" stroke-width="0.3"/>`;
+      gs += `<line x1="${px}" y1="${100-PLAN_PAD}" x2="${px}" y2="${100-PLAN_PAD+1.5}"
+                stroke="#4a525f" stroke-width="0.4"/>`;
+      gs += `<text x="${px}" y="${100-PLAN_PAD+4.5}" font-size="3.2" fill="#8a919d"
+                text-anchor="middle">${Math.round(x)}</text>`;
+    }
+    for(let y = Math.ceil(b.ymin/step)*step; y <= b.ymax; y += step){
+      const [,py] = planXY(b, b.xmin, y);
+      gs += `<line x1="${PLAN_PAD}" y1="${py}" x2="${100-PLAN_PAD}" y2="${py}"
+                stroke="#20242c" stroke-width="0.3"/>`;
+      gs += `<line x1="${PLAN_PAD-1.5}" y1="${py}" x2="${PLAN_PAD}" y2="${py}"
+                stroke="#4a525f" stroke-width="0.4"/>`;
+      gs += `<text x="${PLAN_PAD-2.5}" y="${py+1.1}" font-size="3.2" fill="#8a919d"
+                text-anchor="end">${Math.round(y)}</text>`;
+    }
+    els.gridGroup.innerHTML = gs;
+  }
+
+  if(lastStatus){
+    const xcm = stepsToCm(AXV.x, lastStatus.axis[AXV.x].pos);
+    const ycm = stepsToCm(AXV.y, lastStatus.axis[AXV.y].pos);
+    if(xcm !== null && ycm !== null){
+      const [px,py] = planXY(b, xcm, ycm);
+      setLine(els.curLineH, px-3, py, px+3, py);
+      setLine(els.curLineV, px, py-3, px, py+3);
+      els.curDot.setAttribute('cx', px); els.curDot.setAttribute('cy', py);
+      show(els.curLineH); show(els.curLineV); show(els.curDot);
+    } else {
+      hide(els.curLineH); hide(els.curLineV); hide(els.curDot);
+    }
+  }
+
+  if(planTarget){
+    const [px,py] = planXY(b, planTarget.x, planTarget.y);
+    els.tgtCircle.setAttribute('cx', px); els.tgtCircle.setAttribute('cy', py);
+    positionLabel(els.tgtLabel, px, py, `(${planTarget.x}, ${planTarget.y})`);
+    show(els.tgtCircle); show(els.tgtLabel);
+  } else {
+    hide(els.tgtCircle); hide(els.tgtLabel);
+  }
+
+  if(hoverCm){
+    const [px,py] = planXY(b, hoverCm.x, hoverCm.y);
+    setLine(els.hovLineV, px, PLAN_PAD, px, 100-PLAN_PAD);
+    setLine(els.hovLineH, PLAN_PAD, py, 100-PLAN_PAD, py);
+    els.hovDot.setAttribute('cx', px); els.hovDot.setAttribute('cy', py);
+    positionLabel(els.hovLabel, px, py, `(${hoverCm.x}, ${hoverCm.y})`);
+    show(els.hovLineV); show(els.hovLineH); show(els.hovDot); show(els.hovLabel);
+  } else {
+    hide(els.hovLineV); hide(els.hovLineH); hide(els.hovDot); hide(els.hovLabel);
+  }
+}
+
+// Maps a pointer event to viewBox units, undoing the letterboxing that
+// preserveAspectRatio="xMidYMid meet" adds whenever the element's own box
+// isn't square - without this, clicking landed wherever the box's raw
+// percentage put it, not where the drawn square actually is.
+function planClientToBox(e){
+  const rect = e.currentTarget.getBoundingClientRect();
+  const scale = Math.min(rect.width, rect.height) / 100;
+  const offX = (rect.width  - 100*scale) / 2;
+  const offY = (rect.height - 100*scale) / 2;
+  return [(e.clientX - rect.left - offX) / scale, (e.clientY - rect.top - offY) / scale];
+}
+
+function planEventCm(e){
+  const b = planBounds();
+  if(!b) return null;
+  const [px, py] = planClientToBox(e);
+  const [xcmRaw, ycmRaw] = planInverse(b, px, py);
+  // Snap to the nearest whole centimetre - fine enough for placing the
+  // gantry by eye, and it keeps GO TO fields reading round numbers back.
+  return {
+    x: Math.round(Math.min(Math.max(xcmRaw, b.xmin), b.xmax)),
+    y: Math.round(Math.min(Math.max(ycmRaw, b.ymin), b.ymax))
+  };
+}
+
+document.getElementById('plan').addEventListener('mousemove', e=>{
+  const c = planEventCm(e);
+  hoverCm = c;
+  document.getElementById('hoverCoord').textContent = c ? `${c.x}, ${c.y} cm` : '';
+  drawPlan();
+});
+document.getElementById('plan').addEventListener('mouseleave', ()=>{
+  hoverCm = null;
+  document.getElementById('hoverCoord').textContent = '';
+  drawPlan();
+});
+
+document.getElementById('plan').addEventListener('click', e=>{
+  if(!lastStatus){ log('! not connected'); return; }
+  const b = planBounds();
+  if(!b){
+    log('! refused - no travel limits configured yet for X and/or Y '
+      + '(needs lmax > lmin on both axis 3 and axis 1+2) - use GO TO X,Y instead once spm is known');
+    return;
+  }
+  const c = planEventCm(e);
+  const reason = moveBlockReason(XY_SPECS);
+  if(reason){ log('! refused - '+reason); return; }
+  planTarget = c;
+  document.getElementById('gxx').value = c.x;
+  document.getElementById('gyy').value = c.y;
+  sendMoveCm(AXV.x, CMDV.x, c.x);
+  sendMoveCm(AXV.y, CMDV.y, c.y);
+  drawPlan();
+});
+
+function gotoXY(){
+  if(!lastStatus){ log('! not connected'); return; }
+  const xcm = Math.round(Number(document.getElementById('gxx').value));
+  const ycm = Math.round(Number(document.getElementById('gyy').value));
+  if(!Number.isFinite(xcm) || !Number.isFinite(ycm)){ log('! enter both X and Y in cm'); return; }
+  const reason = moveBlockReason(XY_SPECS);
+  if(reason){ log('! refused - '+reason); return; }
+  planTarget = {x:xcm, y:ycm};
+  sendMoveCm(AXV.x, CMDV.x, xcm);
+  sendMoveCm(AXV.y, CMDV.y, ycm);
+  drawPlan();
+}
+
+function sendMoveCm(axisIdx, cmd, cm){
+  const steps = cmToSteps(axisIdx, cm);
+  if(steps === null){ log('! refused - axis '+cmd+' has no spm calibration yet'); return; }
+  send(`M ${cmd} ${steps}`);
+}
+
+// ---------------------------------------------------------------- Z strip
+function drawZ(){
+  if(document.getElementById('pageGantry').hidden) return;
+  const strip = document.getElementById('zstrip');
+  const b = limitsCm(AXV.z);
+  strip.classList.toggle('locked', !readyToMove([AXV.z]));
+
+  const maxLbl = document.getElementById('zlabelMax');
+  const minLbl = document.getElementById('zlabelMin');
+  if(!b){
+    maxLbl.textContent = ''; minLbl.textContent = '';
+    document.getElementById('zfill').style.height = '0';
+    document.getElementById('zcur').style.bottom = '0';
+    document.getElementById('ztarget').style.display = 'none';
+    document.getElementById('zhover').style.display = 'none';
+    document.getElementById('zlabelHover').style.display = 'none';
+    return;
+  }
+  const [zmin,zmax] = b;
+  maxLbl.textContent = zmax + ' cm';
+  minLbl.textContent = zmin + ' cm';
+
+  if(!lastStatus) return;
+  const zcm = stepsToCm(AXV.z, lastStatus.axis[AXV.z].pos);
+  if(zcm === null) return;
+  const frac = Math.min(Math.max((zcm - zmin) / (zmax - zmin), 0), 1);
+  document.getElementById('zfill').style.height = (frac*100)+'%';
+  document.getElementById('zcur').style.bottom = (frac*100)+'%';
+
+  const tEl = document.getElementById('ztarget');
+  if(zTargetCm !== null){
+    const tfrac = Math.min(Math.max((zTargetCm - zmin) / (zmax - zmin), 0), 1);
+    tEl.style.bottom = (tfrac*100)+'%';
+    tEl.style.display = 'block';
+  } else {
+    tEl.style.display = 'none';
+  }
+
+  const hLine = document.getElementById('zhover');
+  const hLbl  = document.getElementById('zlabelHover');
+  if(zHoverCm !== null){
+    const hfrac = Math.min(Math.max((zHoverCm - zmin) / (zmax - zmin), 0), 1);
+    hLine.style.bottom = (hfrac*100)+'%';
+    hLine.style.display = 'block';
+    hLbl.style.top = ((1-hfrac)*100)+'%';
+    hLbl.textContent = zHoverCm + ' cm';
+    hLbl.style.display = 'block';
+  } else {
+    hLine.style.display = 'none';
+    hLbl.style.display = 'none';
+  }
+}
+
+function zEventCm(e){
+  const b = limitsCm(AXV.z);
+  if(!b) return null;
+  const rect = e.currentTarget.getBoundingClientRect();
+  const frac = 1 - (e.clientY - rect.top) / rect.height;
+  const [zmin,zmax] = b;
+  return Math.round(zmin + Math.min(Math.max(frac,0),1) * (zmax - zmin));
+}
+
+document.getElementById('zstrip').addEventListener('mousemove', e=>{
+  zHoverCm = zEventCm(e);
+  drawZ();
+});
+document.getElementById('zstrip').addEventListener('mouseleave', ()=>{
+  zHoverCm = null;
+  drawZ();
+});
+
+function zClick(e){
+  if(!lastStatus){ log('! not connected'); return; }
+  const zcm = zEventCm(e);
+  if(zcm === null){ log('! no travel limits configured for Z yet - use the GO TO Z box instead'); return; }
+  const reason = moveBlockReason(Z_SPECS);
+  if(reason){ log('! refused - '+reason); return; }
+  zTargetCm = zcm;
+  document.getElementById('gzz').value = zcm;
+  sendMoveCm(AXV.z, CMDV.z, zcm);
+  drawZ();
+}
+
+function gotoZ(){
+  if(!lastStatus){ log('! not connected'); return; }
+  const zcm = Number(document.getElementById('gzz').value);
+  if(!Number.isFinite(zcm)){ log('! GO TO Z wants a position in cm'); return; }
+  const reason = moveBlockReason(Z_SPECS);
+  if(reason){ log('! refused - '+reason); return; }
+  zTargetCm = zcm;
+  sendMoveCm(AXV.z, CMDV.z, zcm);
+  drawZ();
+}
+
+function nudgeZ(dir){
+  if(!lastStatus){ log('! not connected'); return; }
+  const reason = moveBlockReason(Z_SPECS);
+  if(reason){ log('! refused - '+reason); return; }
+  send(`J ${CMDV.z} ${dir*100}`);
 }
 
 build();
