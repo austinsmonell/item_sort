@@ -651,16 +651,32 @@ static void serviceHoming(int a) {
 
 // With ALM unwired this is the only way to notice a latched drive fault:
 // commanded steps keep going out while encoder counts stop following.
+//
+// A fresh move's acceleration ramp makes the encoder legitimately lag the
+// commanded steps, same as STALL_BLANK_STEPS covers during homing. Without a
+// blank window here, the first 100ms sample after any jog/M could span that
+// ramp and read as a following error, tripping a false "lost sync" fault.
 static void serviceSyncWatch(int a) {
   if (!hasEncoder(a) || !stepper[a]) return;
   if (st[a].home != H_IDLE && st[a].home != H_DONE) return;
-  if (!stepper[a]->isRunning()) return;
 
-  static int32_t  lastPos[NUM_AXES] = {0,0,0,0};
-  static int64_t  lastCnt[NUM_AXES] = {0,0,0,0};
-  static uint32_t lastMs[NUM_AXES]  = {0,0,0,0};
+  static int32_t  lastPos[NUM_AXES]    = {0,0,0,0};
+  static int64_t  lastCnt[NUM_AXES]    = {0,0,0,0};
+  static uint32_t lastMs[NUM_AXES]     = {0,0,0,0};
+  static bool     wasRunning[NUM_AXES] = {false,false,false,false};
+
+  bool running = stepper[a]->isRunning();
+  if (!running) { wasRunning[a] = false; return; }
 
   uint32_t now = millis();
+  if (!wasRunning[a]) {
+    wasRunning[a] = true;
+    lastPos[a] = stepper[a]->getCurrentPosition();
+    lastCnt[a] = encCount(a);
+    lastMs[a]  = now;
+    return;
+  }
+
   if (now - lastMs[a] < 100) return;
   lastMs[a] = now;
 
