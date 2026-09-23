@@ -5,3 +5,4 @@ MUJOCO_LOG.TXT
 *.md
 item_sort_cad/
 .claudeignore
+!README.md
