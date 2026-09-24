@@ -1,39 +1,47 @@
 # 3D A* Pathfinding
 
-A* pathfinder for a 3D arena defined in centimetres. The algorithm lives in `astar_core.py`; `astar_gui.py` is a tkinter GUI that calls `plan_path()`.
+A* pathfinder for a 3D arena defined in centimetres. The algorithm lives in `astar_core.py`; `arena_env.py` defines the physical environment, and `astar_gui.py` is a tkinter GUI that plans through it with `plan_path()`.
 
 ## Arena and resolution
 
-Set at the top of `astar_core.py`:
+The environment (walls, moveable area, boxes, carriage and lift) comes from `arena_env.py`; see the Arena environment section below. The only planner setting in `astar_core.py` is the resolution:
 
 ```python
-ARENA_X_CM = 180.0
-ARENA_Y_CM = 160.0
-ARENA_Z_CM = 35.0
 RESOLUTION_CM = 0.25
 ```
 
-The search runs on a lattice of nodes 0.25 cm apart. Node `(i, j, k)` is at `(i, j, k) * 0.25` cm, and both arena edges are included, so the lattice is 721 x 641 x 141 nodes (about 65 million). Obstacles are axis-aligned boxes given in cm (`BoxObstacles`). Listing blocked nodes one by one would not fit in memory at this resolution. There is no robot-size clearance: a path can touch the surface of a box.
+A* plans the **tool point**: carriage x, carriage y and lift z, all in cm, over the arena's moveable area (`move_x` by `move_y` by `move_z`). The search runs on a lattice of nodes 0.25 cm apart. Node `(i, j, k)` is at `(i, j, k) * 0.25` cm, and both edges of the moveable area are included, so with a 154 x 104 x 30 cm area the lattice is 617 x 417 x 121 nodes (about 31 million). Listing blocked nodes one by one would not fit in memory at this resolution, so obstacles stay as boxes (`BoxObstacles`).
+
+### How the environment is passed in
+
+The carriage and lift plate have size, so the planner does not just avoid the boxes: `Arena.configuration_boxes()` grows every box into the region of tool-point positions where the mechanism would touch it. The path is then a plain point path through the leftover free space.
+
+- **Carriage:** it fills the full arena height, so a box blocks every lift z wherever the carriage footprint would overlap it.
+- **Lift plate:** it sits off one face of the carriage, so a box blocks the tool point over an offset region, and only for the z range where the plate would overlap it vertically. The plate's height above the floor is z plus `lift_floor_margin`.
+- **Touching is allowed**, matching `Arena.collisions()`. `plan_path(..., clearance=cm)` adds extra room around every box.
+- **Walls** are not included: the moveable area already keeps the mechanism inside them.
+
+I checked this against `Arena.collisions()` at 20,000 random lattice points with no mismatches, and a planned path across the default layout is collision-free at every point.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `astar_core.py` | Arena constants, `BoxObstacles`, `a_star` (lattice search), `plan_path` (the two-pass planner the GUI uses) |
-| `astar_gui.py` | GUI with a top-down map and a rotatable 3D view |
+| `arena_env.py` | The environment (walls, boxes, carriage, lift), with a standalone jog/geometry viewer |
+| `astar_core.py` | `BoxObstacles`, `a_star` (lattice search), `plan_path` (the two-pass planner the GUI uses) |
+| `astar_gui.py` | GUI: plans through the arena, with a top-down map and a rotatable 3D view |
 
 ## GUI use
 
-Run `python astar_gui.py`.
+Run `python astar_gui.py`. It loads the default arena and box layout from `arena_env.py`; to change either, edit that file.
 
-- **Height z** slider chooses the height you are working at.
-- **Box**: drag a rectangle on the map. Its height range comes from the *Box z* fields (default 0 to 35, a full-height pillar).
-- **Start / Goal**: click; placed at the current height.
-- **Erase**: click a box to delete it.
+- **Start / Goal**: pick one, then click the map (x right, y up, origin bottom left of the moveable area). It is placed at the **Lift z** slider's value. The carriage and plate are drawn where you click, and turn red if they overlap a box.
+- **Run A\***: plans the tool point around all the boxes. It refuses to run if the start or goal is in collision, and after planning it checks every path point against the arena and reports whether the path is collision-free.
+- **Path** slider: steps the carriage and lift along the planned path, in both views.
 - **Diagonals**: 26-direction moves (on by default).
 - **Show explored (3D)**: shows the cells the search expanded, as faint dots. It is off by default because recording them uses extra memory.
 
-On the map, boxes reaching the current height are solid and others are dashed outlines. The path is a thin line, drawn thick where it is within 1 cm of the current height. The right panel shows the whole arena in 3D: **drag to rotate, wheel to zoom**, with the current height as a highlighted plane. Heights are stretched 2.5x there so the 35 cm depth is readable.
+On the map, boxes show their top height in cm (stacked boxes draw on top of those below). The right panel shows the whole arena in 3D: **drag to rotate, wheel to zoom**. The path is drawn at the plate's underside height.
 
 ## How the algorithm works (`astar_core.py`)
 
@@ -49,14 +57,14 @@ Standard A* on the node lattice, choosing the next node by lowest `f = g + weigh
 
 `walls` can be any object supporting `node in walls`, such as a set of nodes or a `BoxObstacles`.
 
-### `plan_path(boxes, start_cm, goal_cm, res=0.25, coarse_res=2.0, diagonals=True, explored=None, corridor=1, fine_weight=2.0)`
+### `plan_path(arena, start_cm, goal_cm, res=0.25, coarse_res=2.0, diagonals=True, explored=None, corridor=1, fine_weight=2.0, clearance=0.0)`
 
-Even with the tie-breaking, a real obstacle forces the search to flood the shadow behind it, and plain A* over 65 million nodes takes minutes in Python. So planning is two-pass:
+Even with the tie-breaking, a real obstacle forces the search to flood the shadow behind it, and plain A* over tens of millions of nodes takes minutes in Python. So planning is two-pass:
 
-1. **Coarse pass:** A* at 2 cm (about 90 x 80 x 18 nodes) over the whole arena. Boxes are grown by half a coarse cell so thin obstacles cannot slip between coarse nodes. If that finds nothing, it retries without the growth.
+1. **Coarse pass:** A* at 2 cm (about 78 x 53 x 16 nodes) over the whole arena. Boxes are grown by half a coarse cell so thin obstacles cannot slip between coarse nodes. If that finds nothing, it retries without the growth.
 2. **Fine pass:** weighted A* (`fine_weight` 2.0) at 0.25 cm, confined to a corridor of `corridor` coarse cells around the coarse path. If it fails, the corridor is widened (2x, then 4x).
 
-Returns cm points from start to goal, or `[]`. Typical scenes take under a second, and scenes with a thin obstacle to go around took about 2 s in testing. An unreachable goal took about 4 s.
+Returns cm points from start to goal, or `[]`. Paths across the default layout took about 0.2 s in testing.
 
 Trade-offs of the two-pass approach:
 
@@ -74,11 +82,11 @@ python arena_env.py
 
 The window shows top, front (x-z) and side (y-z) views. Jog with the +/- buttons, the arrow keys (x/y), PgUp/PgDn or w/s (z), or type a position and press Go. `h` or Home puts the carriage at x = y = 0 with the lift raised. Motion is clamped to the travel limits, and any overlap between the moving parts and a wall or obstacle is drawn red and listed in the status line.
 
-**All wall, carriage and lift dimensions in `ArenaDims` are placeholders**, so edit them from the CAD. Only the moveable area (180 x 160 x 35 cm) comes from your earlier spec. The carriage is a vertical box that fills the full arena height (`wall_height`) and moves in x and y only. The lift plate rides up and down its `+y` face (`plate_side`), with no rod, and its z is the lift's own reading, 0 at the low position and `move_z` at the high one. `lift_floor_margin` does not limit that travel: it places the arena floor, so with the lift reading 0 the plate is `lift_floor_margin` above the floor. The tool point is the carriage centre plus the plate's underside height. The wall clearance is worked out from how far the carriage and plate reach past that point, plus a separate gap for each wall (`wall_gap_x_min`, `wall_gap_x_max`, `wall_gap_y_min`, `wall_gap_y_max`).
+**All wall, carriage and lift dimensions in `ArenaDims` are placeholders**, so edit them from the CAD. The carriage is a vertical box that fills the full arena height (`wall_height`) and moves in x and y only. The lift plate rides up and down its `+y` face (`plate_side`), with no rod, and its z is the lift's own reading, 0 at the low position and `move_z` at the high one. `lift_floor_margin` does not limit that travel: it places the arena floor, so with the lift reading 0 the plate is `lift_floor_margin` above the floor. The tool point is the carriage centre plus the plate's underside height. The wall clearance is worked out from how far the carriage and plate reach past that point, plus a separate gap for each wall (`wall_gap_x_min`, `wall_gap_x_max`, `wall_gap_y_min`, `wall_gap_y_max`).
 
 The standalone window starts with a default layout of floor-standing boxes: 3 large (32 x 20 x 15 cm) and 4 small (15.5 x 21 x 14 cm). Sizes are in `BOX_TYPES` and positions in `DEFAULT_LAYOUT` (`(type, x, y)` or `(type, x, y, z)` for a box stacked at height z; x, y is each box's corner nearest the origin), both in `arena_env.py`.
 
-From code: `Arena().jog("x", 5)`, `.move_to(x, y, z)`, `.collisions()`, and `Arena(obstacles=[(x0, y0, z0, x1, y1, z1)])`. It is not yet connected to `astar_core.py`.
+From code: `Arena().jog("x", 5)`, `.move_to(x, y, z)`, `.collisions()`, and `Arena(obstacles=[(x0, y0, z0, x1, y1, z1)])`. It is used by `astar_core.plan_path()` and `astar_gui.py`.
 
 ## Pseudocode
 
@@ -117,8 +125,10 @@ a_star(walls, W, H, D, start, goal, explored, diagonals, weight):
 ```
 
 ```
-plan_path(boxes, start_cm, goal_cm, res, coarse_res, diagonals, explored,
-          corridor, fine_weight):
+plan_path(arena, start_cm, goal_cm, res, coarse_res, diagonals, explored,
+          corridor, fine_weight, clearance):
+    boxes = arena.configuration_boxes(clearance)     # obstacles grown by the mechanism
+    size  = the arena's moveable area (move_x, move_y, move_z)
     factor = coarse_res / res                        # 2.0 / 0.25 = 8
     start, goal   = start_cm, goal_cm as nodes at res
     cstart, cgoal = start_cm, goal_cm as nodes at coarse_res

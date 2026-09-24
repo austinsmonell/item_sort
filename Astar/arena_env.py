@@ -247,6 +247,42 @@ class Arena:
                     hits.append((m.name, s.name))
         return hits
 
+    def configuration_boxes(self, clearance: float = 0.0) -> List[Box]:
+        """Obstacles in the tool point's configuration space, for planning.
+
+        The tool point is (carriage x, carriage y, lift z). For each obstacle
+        this returns the boxes of tool positions where the mechanism would
+        overlap it:
+          * the carriage, which fills the full arena height, so it blocks
+            every z wherever its footprint would overlap the obstacle;
+          * the lift plate, which blocks only the z range where the plate
+            would overlap the obstacle vertically.
+        `clearance` adds that much extra room around the obstacle. Touching
+        is allowed (as in collisions()), so each box is shrunk by a hair.
+        The walls are not included: the moveable area already keeps the
+        mechanism inside them.
+        """
+        d = self.dims
+        eps = 1e-6
+        c = self.carriage_box(0, 0)
+        p = self.plate_box(0, 0, 0)  # plate at lift z = 0, in world z
+        big = 1e6
+        out: List[Box] = []
+        for o in self.obstacles:
+            b = o.box
+            if b[2] < c[5] and b[5] > c[2]:  # overlaps the carriage's height
+                out.append((b[0] - c[3] - clearance + eps,
+                            b[1] - c[4] - clearance + eps, -big,
+                            b[3] - c[0] + clearance - eps,
+                            b[4] - c[1] + clearance - eps, big))
+            out.append((b[0] - p[3] - clearance + eps,
+                        b[1] - p[4] - clearance + eps,
+                        b[2] - p[5] - clearance + eps,
+                        b[3] - p[0] + clearance - eps,
+                        b[4] - p[1] + clearance - eps,
+                        b[5] - p[2] + clearance - eps))
+        return out
+
     def overall_size(self) -> Tuple[float, float, float]:
         """Outside dimensions of the walls (x, y) and their height."""
         ix0, iy0, ix1, iy1 = self.inner_box()

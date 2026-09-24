@@ -1,21 +1,25 @@
 """The actual 3D A* algorithm, used by astar_gui.py so the GUI runs the real
 pathfinder instead of a separate reimplementation.
 
-The arena is defined in centimetres (ARENA_*_CM) and searched on a lattice
-of nodes spaced RESOLUTION_CM apart. Node (i, j, k) sits at
-(i, j, k) * RESOLUTION_CM cm, and the lattice includes both arena edges, so
-each axis has size/resolution + 1 nodes. Obstacles are axis-aligned boxes
-given in cm (see BoxObstacles) - at this resolution the arena has tens of
-millions of nodes, far too many to list blocked nodes one by one.
+The environment comes from arena_env.Arena. A* plans the *tool point*
+(carriage x, carriage y, lift z, all in cm) over the arena's moveable area
+on a lattice of nodes spaced RESOLUTION_CM apart. Node (i, j, k) sits at
+(i, j, k) * RESOLUTION_CM cm, and the lattice includes both edges of the
+moveable area, so each axis has size/resolution + 1 nodes.
+
+The mechanism has size, so obstacles are converted to the tool point's
+configuration space (Arena.configuration_boxes): each box becomes the region
+of tool-point positions where the carriage or the lift plate would touch it.
+Path nodes are then points, and any node outside those regions is
+collision-free. Boxes stay boxes (BoxObstacles) - at this resolution the
+lattice has tens of millions of nodes, far too many to list blocked nodes one
+by one.
 """
 
 import heapq
 import itertools
 import math
 
-ARENA_X_CM = 180.0
-ARENA_Y_CM = 160.0
-ARENA_Z_CM = 35.0
 RESOLUTION_CM = 0.25
 
 
@@ -23,10 +27,9 @@ def _nodes(size_cm, res):
     return int(round(size_cm / res)) + 1
 
 
-def arena_nodes(res=RESOLUTION_CM):
-    """Number of nodes along (x, y, z) for the arena at resolution res."""
-    return (_nodes(ARENA_X_CM, res), _nodes(ARENA_Y_CM, res),
-            _nodes(ARENA_Z_CM, res))
+def lattice_nodes(size_cm, res=RESOLUTION_CM):
+    """Number of nodes along (x, y, z) for a moveable area of size_cm."""
+    return tuple(_nodes(v, res) for v in size_cm)
 
 
 def cm_to_node(p, res=RESOLUTION_CM):
@@ -200,9 +203,11 @@ class _Corridor:
         return cell not in self.cells or node in self.obstacles
 
 
-def plan_path(boxes, start_cm, goal_cm, res=RESOLUTION_CM, coarse_res=2.0,
-              diagonals=True, explored=None, corridor=1, fine_weight=2.0):
-    """Plan a path through the arena, in cm, at resolution `res`.
+def plan_path(arena, start_cm, goal_cm, res=RESOLUTION_CM, coarse_res=2.0,
+              diagonals=True, explored=None, corridor=1, fine_weight=2.0,
+              clearance=0.0):
+    """Plan a tool-point path through an arena_env.Arena, in cm, at
+    resolution `res`.
 
     A search over all ~64 million nodes at 0.25 cm is far too slow in
     Python whenever an obstacle forces a detour, so this plans in two
@@ -213,7 +218,10 @@ def plan_path(boxes, start_cm, goal_cm, res=RESOLUTION_CM, coarse_res=2.0,
       2. a fine A* at `res` cm restricted to a band `corridor` coarse
          cells around the coarse path (widened if that fails), run as
          weighted A* (`fine_weight`) so it doesn't flood the corridor.
-    boxes: list of (x0, y0, z0, x1, y1, z1) in cm.
+    arena: the environment. Its moveable area gives the search bounds, and
+    its obstacles (grown by the carriage and lift plate, plus `clearance`
+    cm of extra room) are what the path must avoid.
+    start_cm, goal_cm: (x, y, z) tool-point positions.
     explored: optional set that receives every expanded node as (x, y, z)
     cm, from both passes.
     Returns a list of (x, y, z) cm points from start to goal, or [] if no
@@ -225,8 +233,11 @@ def plan_path(boxes, start_cm, goal_cm, res=RESOLUTION_CM, coarse_res=2.0,
     if factor < 1 or abs(factor * res - coarse_res) > 1e-9:
         raise ValueError("coarse_res must be a whole multiple of res")
 
-    fine_n = arena_nodes(res)
-    coarse_n = arena_nodes(coarse_res)
+    d = arena.dims
+    size = (d.move_x, d.move_y, d.move_z)
+    boxes = arena.configuration_boxes(clearance)
+    fine_n = lattice_nodes(size, res)
+    coarse_n = lattice_nodes(size, coarse_res)
     start = cm_to_node(start_cm, res)
     goal = cm_to_node(goal_cm, res)
     cstart = cm_to_node(start_cm, coarse_res)
