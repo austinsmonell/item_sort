@@ -64,6 +64,22 @@ Trade-offs of the two-pass approach:
 - A gap much narrower than `coarse_res` (2 cm) may be missed, so the planner can report `no path` for a goal that is technically reachable through it.
 - The fine path is a staircase of 26-direction moves and is not smoothed.
 
+## Arena environment (`arena_env.py`)
+
+`Arena` models the physical setup: the outer walls, the moveable area, the carriage and the lift (rod and plate). Run it standalone to check the geometry and jog the mechanism by hand:
+
+```
+python arena_env.py
+```
+
+The window shows top, front (x-z) and side (y-z) views. Jog with the +/- buttons, the arrow keys (x/y), PgUp/PgDn or w/s (z), or type a position and press Go. `h` or Home puts the carriage at x = y = 0 with the lift raised. Motion is clamped to the travel limits, and any overlap between the moving parts and a wall or obstacle is drawn red and listed in the status line.
+
+**All wall, carriage and lift dimensions in `ArenaDims` are placeholders**, so edit them from the CAD. Only the moveable area (180 x 160 x 35 cm) comes from your earlier spec. The carriage is a vertical box that fills the full arena height (`wall_height`) and moves in x and y only. The lift plate rides up and down its `+y` face (`plate_side`), with no rod, and its z is the lift's own reading, 0 at the low position and `move_z` at the high one. `lift_floor_margin` does not limit that travel: it places the arena floor, so with the lift reading 0 the plate is `lift_floor_margin` above the floor. The tool point is the carriage centre plus the plate's underside height. The wall clearance is worked out from how far the carriage and plate reach past that point, plus a separate gap for each wall (`wall_gap_x_min`, `wall_gap_x_max`, `wall_gap_y_min`, `wall_gap_y_max`).
+
+The standalone window starts with a default layout of floor-standing boxes: 3 large (32 x 20 x 15 cm) and 4 small (15.5 x 21 x 14 cm). Sizes are in `BOX_TYPES` and positions in `DEFAULT_LAYOUT` (`(type, x, y)` or `(type, x, y, z)` for a box stacked at height z; x, y is each box's corner nearest the origin), both in `arena_env.py`.
+
+From code: `Arena().jog("x", 5)`, `.move_to(x, y, z)`, `.collisions()`, and `Arena(obstacles=[(x0, y0, z0, x1, y1, z1)])`. It is not yet connected to `astar_core.py`.
+
 ## Pseudocode
 
 ```
