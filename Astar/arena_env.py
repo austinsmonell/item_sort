@@ -99,6 +99,8 @@ BOX_TYPES = {
     "small": (15.5, 21.0, 14.0),
 }
 
+BOX_LIFT_HEIGHT = 8.0  # a box's lift point is this far above its bottom
+
 # Default layout: (box type, x, y) or (box type, x, y, z), with (x, y) the
 # box's corner nearest the origin in the world frame and z the height of its
 # underside (default 0, the floor). Edit freely.
@@ -198,6 +200,36 @@ class Arena:
             ya, yb = sorted((y + sign * near, y + sign * (near + d.plate_len)))
             xa, xb = x - d.plate_width / 2, x + d.plate_width / 2
         return (xa, ya, z, xb, yb, z + d.plate_t)
+
+    def box_lift_point(self, box: Box) -> Tuple[float, float, float]:
+        """Where a box is grabbed to lift it: centre of its back (+y) face,
+        `BOX_LIFT_HEIGHT` above its bottom."""
+        x0, y0, z0, x1, y1, z1 = box
+        return ((x0 + x1) / 2, y1, z0 + BOX_LIFT_HEIGHT)
+
+    def plate_lift_point(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
+        """The lift plate's own lift point: centre of its front top edge,
+        i.e. the top of the edge farthest from the carriage."""
+        d = self.dims
+        sign = 1 if d.plate_side[0] == "+" else -1
+        top = z + d.lift_floor_margin + d.plate_t
+        if d.plate_side[1] == "x":
+            far = x + sign * (d.carriage_w / 2 + d.plate_len)
+            return (far, y, top)
+        far = y + sign * (d.carriage_d / 2 + d.plate_len)
+        return (x, far, top)
+
+    def tool_point_for_lift(self, lift_point: Tuple[float, float, float]
+                            ) -> Tuple[float, float, float]:
+        """The tool point (carriage x, y, lift z) that puts the plate's own
+        lift point exactly on `lift_point` - the inverse of
+        plate_lift_point(). plate_lift_point() only ever adds a fixed
+        (x, y, z) offset to the tool point (which offset axis is nonzero
+        depends on plate_side), so subtracting that same offset, computed at
+        the origin, inverts it."""
+        ox, oy, oz = self.plate_lift_point(0.0, 0.0, 0.0)
+        lx, ly, lz = lift_point
+        return (lx - ox, ly - oy, lz - oz)
 
     def carriage_box(self, x: float, y: float) -> Box:
         d = self.dims
@@ -370,6 +402,15 @@ class View:
             bad = sol.name in hit_names
             rect(sol.box, fill=HIT_COLOR if bad else KIND_COLOR[sol.kind],
                  outline="white", stipple="gray50" if sol.kind == "carriage" else "")
+
+        # lift points
+        def point(p, color):
+            px, py, r = sx(p[self.h]), sy(p[self.v]), 3
+            c.create_oval(px - r, py - r, px + r, py + r, fill=color, outline="black")
+
+        for o in arena.obstacles:
+            point(arena.box_lift_point(o.box), "#ffd23c")
+        point(arena.plate_lift_point(*arena.pos), "#ff5fb0")
 
         c.create_text(6, 4, anchor="nw", fill="#bbbbbb", text=self.title)
 

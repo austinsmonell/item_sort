@@ -322,6 +322,7 @@ are numbered **1–4**; axis 1 and 2 are one gantry and always move together.
 |---|---|
 | `J <axis> <steps>` | Jog. Negative reverses. Adds to a move already in flight. |
 | `M <axis> <pos>` | Move to an absolute step position. |
+| `MS <axis> <pos> <hz> <acc>` | Absolute move at this cruise speed and acceleration, for one move only (capped at `run` / `acc`, not saved). Used by the A* path follower so axes ramp together. |
 | `H <axis>` | Home one axis. `H 1` or `H 2` homes both gantry ends. |
 | `HA` | Home every enabled axis, one at a time. |
 | `Z <axis>` | Set the current position as zero. |

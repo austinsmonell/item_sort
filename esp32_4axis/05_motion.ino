@@ -99,6 +99,33 @@ static void commandMove(int a, long v, bool absolute) {
   }
 }
 
+// One-shot absolute move with its own cruise speed and acceleration, for the
+// host to run a coordinated path: it sets each axis's speed to its share of the
+// path speed, and its acceleration in the same proportion, so the axes ramp up,
+// cruise and ramp down together and arrive as one. Both are capped at the
+// configured run/acc, and neither is persisted - the next ordinary move puts
+// the configured values back through applyAxisSpeed().
+static void issueMoveAt(int a, long target, uint32_t hz, uint32_t acc) {
+  if (!stepper[a]) return;
+  stepper[a]->setSpeedInHz(constrain(hz, 1UL, (unsigned long)cfg[a].runSpeed));
+  stepper[a]->setAcceleration(constrain(acc, 1UL, (unsigned long)cfg[a].accel));
+  stepper[a]->moveTo(target);
+  setCmdTarget(a, target);
+}
+
+// Same clamp and gantry fan-out as commandMove(), absolute only.
+static void commandMoveAt(int a, long v, uint32_t hz, uint32_t acc) {
+  if (!stepper[a]) return;
+  syncTargetIfSettled(a);
+  long clamped = clampToLimits(a, v);
+  if (clamped != v)
+    outf("# axis %d limited to %ld steps (%s window, travel %ld to %ld mm)",
+         a + 1, clamped, st[a].isHomed ? "homed" : "power-on",
+         (long)cfg[a].limitMinMm, (long)cfg[a].limitMaxMm);
+  issueMoveAt(a, clamped, hz, acc);
+  if (isGantry(a)) issueMoveAt(partnerOf(a), clamped, hz, acc);
+}
+
 static void zeroOne(int a) {
   if (!stepper[a]) return;
   stepper[a]->setCurrentPosition(0);

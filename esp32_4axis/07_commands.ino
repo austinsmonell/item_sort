@@ -6,6 +6,8 @@ static void printHelp() {
   outLine("# commands (axis is 1-4; 1 and 2 are one gantry, always move together):");
   outLine("#   J <axis> <steps>     jog, negative steps reverses");
   outLine("#   M <axis> <pos>       move to absolute position");
+  outLine("#   MS <axis> <pos> <hz> <acc>  move to absolute position at this speed/accel");
+  outLine("#                        (one move, capped at run/acc, not saved)");
   outLine("#   H <axis>             home one axis (1 or 2 homes both ends)");
   outLine("#   HA                   home all, one at a time");
   outLine("#   Z <axis>             set current position as zero");
@@ -92,11 +94,11 @@ static void execLine(String line) {
   line.trim();
   if (!line.length()) return;
 
-  // split into up to 4 whitespace-separated tokens
-  String tok[4];
+  // split into up to 5 whitespace-separated tokens
+  String tok[5];
   int n = 0;
   int i = 0;
-  while (i < (int)line.length() && n < 4) {
+  while (i < (int)line.length() && n < 5) {
     while (i < (int)line.length() && line[i] == ' ') i++;
     int s = i;
     while (i < (int)line.length() && line[i] != ' ') i++;
@@ -267,6 +269,17 @@ static void execLine(String line) {
     if (busyHoming(a)) { outf("# axis %d busy homing", a + 1); return; }
     if (n < 3) { outLine("# missing distance"); return; }
     commandMove(a, tok[2].toInt(), cmd == "M");
+    return;
+  }
+
+  if (cmd == "MS") {
+    if (estopActive) { outLine("# blocked: e-stop engaged"); return; }
+    if (!drivesEnabled) { outLine("# blocked: drives disabled - EN 1 first"); return; }
+    if (!stepper[a]) return;
+    if (busyHoming(a)) { outf("# axis %d busy homing", a + 1); return; }
+    if (n < 5) { outLine("# usage: MS <axis> <pos> <hz> <acc>"); return; }
+    commandMoveAt(a, tok[2].toInt(), (uint32_t)max(1L, tok[3].toInt()),
+                  (uint32_t)max(1L, tok[4].toInt()));
     return;
   }
 

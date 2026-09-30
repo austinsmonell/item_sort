@@ -29,6 +29,7 @@ I checked this against `Arena.collisions()` at 20,000 random lattice points with
 |------|---------|
 | `arena_env.py` | The environment (walls, boxes, carriage, lift), with a standalone jog/geometry viewer |
 | `astar_core.py` | `BoxObstacles`, `a_star` (lattice search), `plan_path` (the two-pass planner the GUI uses) |
+| `esp_link.py` | WiFi link that streams a planned path to the ESP32 |
 | `astar_gui.py` | GUI: plans through the arena, with a top-down map and a rotatable 3D view |
 
 ## GUI use
@@ -42,6 +43,20 @@ Run `python astar_gui.py`. It loads the default arena and box layout from `arena
 - **Show explored (3D)**: shows the cells the search expanded, as faint dots. It is off by default because recording them uses extra memory.
 
 On the map, boxes show their top height in cm (stacked boxes draw on top of those below). The right panel shows the whole arena in 3D: **drag to rotate, wheel to zoom**. The path is drawn at the plate's underside height.
+
+## Driving the ESP32 (`esp_link.py`)
+
+The GUI's machine bar sends the planned path to the `esp32_4axis` controller over WiFi, using the same WebSocket (`ws://<host>:81`) as `stepper_gui.html` (needs `pip install websocket-client`).
+
+1. Enter the board's hostname (`stepper.local`) or IP and **Connect**. All three axes must be homed and the drives on.
+2. **Start is always the machine's current position** (carriage x, y and lift z), updated live while connected; clicks on the map set the Goal only. Click a Goal and **Run A\***. If the machine moves after planning, run A* again, because the path must begin where the machine is.
+3. Set **Speed** and press **Send path to machine**. **STOP** sends `S`. The map follows the commanded position.
+
+The firmware runs each axis independently, so the path is streamed rather than sent as waypoints: every 50 ms the host sends a fresh absolute `M` target for each axis, sampled along the planned line at the chosen tool speed (capped at 70% of the slowest axis's `run` speed). `smooth_path()` first pulls the 0.25 cm lattice staircase into a few straight, collision-checked segments (a 646-point path became 13), because chasing the staircase makes the motors wiggle. Paths that leave a firmware soft limit are refused before anything moves.
+
+**Check `AXIS_MAP` in `esp_link.py` before first use.** x = axis 3, y = axis 1 (the gantry pair), z = axis 4 are guesses from the travel lengths in the ESP32 README, and it assumes step 0 after homing is tool coordinate 0. Set `sign` / `offset_cm` per axis if a direction is reversed or the zero is elsewhere. Axis 4 is open loop, so a stall there is invisible.
+
+The corners of the path are followed with a little tracking lag, and `plan_path` allows touching a box. The GUI's **Clearance** field (default 0.5 cm) keeps the path off the boxes.
 
 ## How the algorithm works (`astar_core.py`)
 

@@ -187,6 +187,26 @@ def a_star(walls, width, height, depth, start, goal, explored=None,
     return []
 
 
+class _ExemptNodes:
+    """Wraps another obstacle set but never blocks a fixed set of nodes.
+
+    A start or goal that's touching a box (the plate at its lift point, say)
+    is not actually in collision - plan_path's caller already checks that
+    with the real, unclearanced geometry - but it can still fall inside that
+    box's *clearance-grown* region and so register as blocked, making the
+    search fail before it even begins. Exempting only the exact endpoint
+    node (not a halo around it) lets the search start/end there while still
+    keeping full clearance everywhere else, including the very next step.
+    """
+
+    def __init__(self, walls, exempt):
+        self.walls = walls
+        self.exempt = exempt
+
+    def __contains__(self, node):
+        return node not in self.exempt and node in self.walls
+
+
 class _Corridor:
     """Blocks every node whose nearest coarse node is not in `cells`, plus
     everything blocked by `obstacles`. Used to confine the fine search to a
@@ -203,7 +223,7 @@ class _Corridor:
         return cell not in self.cells or node in self.obstacles
 
 
-def plan_path(arena, start_cm, goal_cm, res=RESOLUTION_CM, coarse_res=2.0,
+def plan_path(arena, start_cm, goal_cm, res=RESOLUTION_CM, coarse_res=0.5,
               diagonals=True, explored=None, corridor=1, fine_weight=2.0,
               clearance=0.0):
     """Plan a tool-point path through an arena_env.Arena, in cm, at
@@ -247,10 +267,11 @@ def plan_path(arena, start_cm, goal_cm, res=RESOLUTION_CM, coarse_res=2.0,
         if explored is not None:
             explored.update(node_to_cm(n, r) for n in nodes)
 
+    endpoints = {cstart, cgoal}
     for margin in (coarse_res / 2, 0.0):
         seen = set()
-        coarse = a_star(BoxObstacles(boxes, coarse_res, margin), *coarse_n,
-                        cstart, cgoal, seen, diagonals)
+        obstacles = _ExemptNodes(BoxObstacles(boxes, coarse_res, margin), endpoints)
+        coarse = a_star(obstacles, *coarse_n, cstart, cgoal, seen, diagonals)
         note(seen, coarse_res)
         if coarse:
             break
@@ -269,9 +290,63 @@ def plan_path(arena, start_cm, goal_cm, res=RESOLUTION_CM, coarse_res=2.0,
                     for dz in range(-r, r + 1):
                         cells.add((cx + dx, cy + dy, cz + dz))
         seen = set()
-        path = a_star(_Corridor(fine_obstacles, cells, factor), *fine_n,
-                      start, goal, seen, diagonals, fine_weight)
+        obstacles = _ExemptNodes(_Corridor(fine_obstacles, cells, factor), {start, goal})
+        path = a_star(obstacles, *fine_n, start, goal, seen, diagonals, fine_weight)
         note(seen, res)
         if path:
             return [node_to_cm(n, res) for n in path]
     return []
+
+
+def _segment_hits_box(a, b, box):
+    """True if the segment a-b passes through the inside of `box` (slab test;
+    grazing a face or edge does not count)."""
+    t0, t1 = 0.0, 1.0
+    for i in range(3):
+        d = b[i] - a[i]
+        lo, hi = box[i], box[i + 3]
+        if abs(d) < 1e-12:
+            if not lo < a[i] < hi:
+                return False
+            continue
+        ta, tb = (lo - a[i]) / d, (hi - a[i]) / d
+        if ta > tb:
+            ta, tb = tb, ta
+        t0, t1 = max(t0, ta), min(t1, tb)
+        if t0 >= t1 - 1e-9:
+            return False
+    return True
+
+
+def smooth_path(arena, path, clearance=0.0, margin=0.0):
+    """Replace the lattice staircase with straight segments.
+
+    plan_path returns 0.25 cm steps in 26 directions, which zigzags at the
+    scale of the motors. This pulls the path taut: from each kept point it
+    jumps to the farthest later point that can be reached in a straight line
+    without entering any obstacle, so the result is a few long straight
+    segments with corners only where an obstacle forces one. `margin` keeps
+    each segment that far off the (already mechanism-grown) obstacles.
+    """
+    if len(path) < 3:
+        return list(path)
+    boxes = [(b[0] - margin, b[1] - margin, b[2] - margin,
+              b[3] + margin, b[4] + margin, b[5] + margin)
+             for b in arena.configuration_boxes(clearance)]
+    # Only the boxes near the corridor matter; a cheap bounding filter per call
+    out = [path[0]]
+    i = 0
+    while i < len(path) - 1:
+        j = len(path) - 1
+        while j > i + 1:
+            a, b = path[i], path[j]
+            lo = [min(a[k], b[k]) for k in range(3)]
+            hi = [max(a[k], b[k]) for k in range(3)]
+            near = [bx for bx in boxes
+                    if all(bx[k] < hi[k] and bx[k + 3] > lo[k] for k in range(3))]
+            if not any(_segment_hits_box(a, b, bx) for bx in near):
+                break
+            j -= 1
+        out.append(path[j])
+        i = j
+    return out
