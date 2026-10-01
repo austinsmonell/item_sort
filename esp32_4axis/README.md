@@ -198,7 +198,7 @@ distance and put a rule on it.
 |---|---|---|
 | 1 + 2 | 11000 steps = 100.8 cm | 10913 |
 | 3 | 16000 steps = 148.5 cm | 10774 |
-| 4 | 47000 steps = 28.0 cm | 167857 |
+| 4 | 15 cm commanded moved 12.6 cm at the old 167857 (47000 steps = 28.0 cm), so 167857 x 15 / 12.6 = 199830; set to the screw's 8 mm lead / 1600 ppr | 200000 |
 
 Steps per **metre** rather than per mm so an integer keeps the precision: 10913
 is 0.003% off, which is 0.03 mm over a whole axis.

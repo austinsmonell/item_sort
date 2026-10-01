@@ -19,8 +19,14 @@ by one.
 import heapq
 import itertools
 import math
+import time
 
 RESOLUTION_CM = 0.25
+PLAN_TIMEOUT_S = 60.0   # plan_path() gives up after this long
+
+
+class PlanningTimeout(Exception):
+    """plan_path() ran past its time limit without finding a path."""
 
 
 def _nodes(size_cm, res):
@@ -117,7 +123,7 @@ def _h_axis(a, b):
 
 
 def a_star(walls, width, height, depth, start, goal, explored=None,
-           diagonals=True, weight=1.0):
+           diagonals=True, weight=1.0, deadline=None):
     """A* over a 3D lattice of width x height x depth nodes.
 
     walls: anything supporting `node in walls` for (i, j, k) nodes - a set
@@ -132,6 +138,8 @@ def a_star(walls, width, height, depth, start, goal, explored=None,
     weight: heuristic multiplier. 1.0 gives a shortest path; larger values
     (weighted A*) expand far fewer nodes and return a path at most `weight`
     times longer than optimal.
+    deadline: optional time.monotonic() value; past it the search raises
+    PlanningTimeout (checked every 1024 expansions, so it's cheap).
     Returns the path from start to goal inclusive as a list of (i, j, k)
     nodes, or an empty list if the goal is unreachable.
     """
@@ -155,6 +163,8 @@ def a_star(walls, width, height, depth, start, goal, explored=None,
         if current in closed:
             continue  # stale duplicate entry
         closed.add(current)
+        if deadline is not None and len(closed) % 1024 == 0 and time.monotonic() > deadline:
+            raise PlanningTimeout
 
         if explored is not None:
             explored.add(current)
@@ -225,7 +235,7 @@ class _Corridor:
 
 def plan_path(arena, start_cm, goal_cm, res=RESOLUTION_CM, coarse_res=0.5,
               diagonals=True, explored=None, corridor=1, fine_weight=2.0,
-              clearance=0.0):
+              clearance=0.0, timeout=PLAN_TIMEOUT_S):
     """Plan a tool-point path through an arena_env.Arena, in cm, at
     resolution `res`.
 
@@ -244,11 +254,14 @@ def plan_path(arena, start_cm, goal_cm, res=RESOLUTION_CM, coarse_res=0.5,
     start_cm, goal_cm: (x, y, z) tool-point positions.
     explored: optional set that receives every expanded node as (x, y, z)
     cm, from both passes.
+    timeout: seconds (None for no limit) after which it gives up and
+    raises PlanningTimeout, across both passes.
     Returns a list of (x, y, z) cm points from start to goal, or [] if no
     path was found. The result is near-optimal rather than guaranteed
     optimal (at most fine_weight times the best path in the corridor), and
     gaps much narrower than coarse_res may be missed.
     """
+    deadline = None if timeout is None else time.monotonic() + timeout
     factor = round(coarse_res / res)
     if factor < 1 or abs(factor * res - coarse_res) > 1e-9:
         raise ValueError("coarse_res must be a whole multiple of res")
@@ -271,7 +284,8 @@ def plan_path(arena, start_cm, goal_cm, res=RESOLUTION_CM, coarse_res=0.5,
     for margin in (coarse_res / 2, 0.0):
         seen = set()
         obstacles = _ExemptNodes(BoxObstacles(boxes, coarse_res, margin), endpoints)
-        coarse = a_star(obstacles, *coarse_n, cstart, cgoal, seen, diagonals)
+        coarse = a_star(obstacles, *coarse_n, cstart, cgoal, seen, diagonals,
+                        deadline=deadline)
         note(seen, coarse_res)
         if coarse:
             break
@@ -291,7 +305,8 @@ def plan_path(arena, start_cm, goal_cm, res=RESOLUTION_CM, coarse_res=0.5,
                         cells.add((cx + dx, cy + dy, cz + dz))
         seen = set()
         obstacles = _ExemptNodes(_Corridor(fine_obstacles, cells, factor), {start, goal})
-        path = a_star(obstacles, *fine_n, start, goal, seen, diagonals, fine_weight)
+        path = a_star(obstacles, *fine_n, start, goal, seen, diagonals, fine_weight,
+                      deadline=deadline)
         note(seen, res)
         if path:
             return [node_to_cm(n, res) for n in path]

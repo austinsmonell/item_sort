@@ -35,7 +35,7 @@ from dataclasses import dataclass
 import websocket  # pip install websocket-client
 
 WS_PORT = 81
-DEFAULT_SPEED_CM_S = 4.0  # tool speed along the path
+DEFAULT_SPEED_CM_S = 50.0  # tool speed along the path
 SPEED_FRACTION = 0.7      # of each axis's configured `run` speed
 ACCEL_FRACTION = 0.7      # of each axis's configured `acc`
 SETTLE_TOL_CM = 0.3       # how close counts as "arrived"

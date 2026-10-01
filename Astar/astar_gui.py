@@ -14,7 +14,16 @@ cm.
 
 Run A* plans the tool point (carriage x, carriage y, lift z) around every box,
 allowing for the size of the carriage and plate. The Path slider then steps
-the carriage and lift along the planned path.
+the carriage and lift along the planned path. "Send path" runs it on the
+machine, or - when not connected - simulates it, moving Start to its end.
+
+Picking up and placing a box: once a path that ends with a box's full pick
+sequence has run, that box is on the lift - it moves with the tool point
+and A* plans around the walls, floor and other boxes for it too. Drag it
+on the map to where it should go (it rests on the floor, or on top of
+whatever box is under it) and Run A*: the path carries it there, lowers it
+into place, and runs the pick sequence in reverse to drop it, after which
+it is an ordinary box again.
 
 Right: a 3D view of the whole arena. Drag to rotate, mouse wheel to zoom,
 click to set the Goal the same way as on the map - near a box's yellow lift
@@ -32,8 +41,10 @@ import time
 import traceback
 import tkinter as tk
 
-from arena_env import (BOX_TYPES, HIT_COLOR, KIND_COLOR, Arena, make_boxes)
-from astar_core import RESOLUTION_CM, BoxObstacles, cm_to_node, plan_path, smooth_path
+from arena_env import (BOX_TYPES, HIT_COLOR, KIND_COLOR, Arena, Solid,
+                       make_boxes)
+from astar_core import (PLAN_TIMEOUT_S, RESOLUTION_CM, BoxObstacles, PlanningTimeout,
+                        cm_to_node, plan_path, smooth_path)
 from esp_link import DEFAULT_SPEED_CM_S, EspLink, LinkError
 
 PX = 3                        # map pixels per cm
@@ -41,6 +52,9 @@ VIEW_W = 520
 VIEW_H = 480
 MAX_EXPLORED_DOTS = 4000
 PATH_COLOR = "#46b478"
+LIMIT_COLOR = "#4a7db5"       # the moveable area / lift limits (dashed)
+PLACE_COLOR = "#9fd0ff"       # where a carried box is to be placed
+DEFAULT_PICK_SEQUENCE = "y-2, z4"  # starting pick sequence for every box type
 
 
 def snap(v, lo, hi):
@@ -117,8 +131,20 @@ class AStarGui:
         self.engaged_sequence = []
         self.engaged_steps = 0
 
+        # carrying a box (self.arena.carried): the pick steps that picked it
+        # up, reversed to drop it, and where it was picked from (Clear puts
+        # it back there when not connected).
+        self.carry_sequence = []
+        self.carry_origin = None
+        # a place goal for the carried box: the box where it is to end up
+        # (also drawn as the drag ghost), and the grab offset while dragging
+        self.place_box = None
+        self._drag = None
+
         self.path = []
         self.path_ignore = []
+        self.on_arrival = None    # applies what the path does (pick, drop) once it has run
+        self.path_rule = None     # see show_pose()
         self.explored = set()
 
         self.yaw = math.radians(35)
@@ -140,6 +166,8 @@ class AStarGui:
                    textvariable=self.clearance).pack(side="left", padx=2)
         tk.Button(toolbar, text="Run A*", command=self.run).pack(side="left", padx=(12, 2))
         tk.Button(toolbar, text="Clear", command=self.clear).pack(side="left", padx=2)
+        tk.Button(toolbar, text="Place box here", command=self.place_here
+                  ).pack(side="left", padx=2)
 
         # per box type, the sequence of tool-point moves to run once the
         # plate reaches that box's exact lift point, to pick it up (see
@@ -148,20 +176,39 @@ class AStarGui:
         # engaging it; every other obstacle still blocks them. There's no
         # separate drop sequence to configure: leaving an engaged box always
         # runs this same sequence in reverse to disengage (disengage_start()).
-        self.pick_seq = {kind: tk.StringVar(value="") for kind in BOX_TYPES}
+        self.pick_seq = {kind: tk.StringVar(value=DEFAULT_PICK_SEQUENCE) for kind in BOX_TYPES}
 
         seqframe = tk.LabelFrame(
             root, text='Pick sequence per box type, run once the plate reaches '
                        'the box - e.g. "y1, z-0.5" (axis + signed cm, in order). '
-                       "Leaving an engaged box automatically reverses it to "
-                       "disengage.")
+                       "Once it has run the box is on the lift; click or drag on the map "
+                       "to place it, which reverses the sequence to drop it.")
         seqframe.pack(fill="x", padx=8, pady=(0, 8))
         tk.Label(seqframe, text="Box type").grid(row=0, column=0, padx=(4, 4))
         tk.Label(seqframe, text="Pick sequence").grid(row=0, column=1, padx=4)
+        tk.Label(seqframe, text="Lift height (cm above box bottom)").grid(row=0, column=2, padx=4)
+        # per box type, how far above its bottom the plate lifts it from
+        self.lift_height = {kind: tk.StringVar(value=f"{self.arena.lift_height(kind):g}")
+                            for kind in BOX_TYPES}
         for r, kind in enumerate(BOX_TYPES, start=1):
             tk.Label(seqframe, text=kind).grid(row=r, column=0, sticky="w", padx=(4, 4))
             tk.Entry(seqframe, textvariable=self.pick_seq[kind], width=20
                      ).grid(row=r, column=1, padx=4, pady=1, sticky="w")
+            tk.Spinbox(seqframe, from_=0, to=50, increment=0.25, width=6,
+                       textvariable=self.lift_height[kind]
+                       ).grid(row=r, column=2, padx=4, pady=1, sticky="w")
+            self.lift_height[kind].trace_add(
+                "write", lambda *_, k=kind: self.on_lift_height(k))
+
+        boxbar = tk.Frame(root)
+        boxbar.pack(fill="x", padx=8, pady=(0, 6))
+        tk.Label(boxbar, text="Boxes:").pack(side="left")
+        self.load_kind = tk.StringVar(value=next(iter(BOX_TYPES)))
+        tk.OptionMenu(boxbar, self.load_kind, *BOX_TYPES).pack(side="left", padx=(8, 2))
+        tk.Button(boxbar, text="Load on lift", command=self.load_on_lift
+                  ).pack(side="left", padx=2)
+        tk.Button(boxbar, text="Remove all boxes", command=self.remove_all_boxes
+                  ).pack(side="left", padx=(12, 2))
 
         zbar = tk.Frame(root)
         zbar.pack(fill="x", padx=8)
@@ -177,6 +224,11 @@ class AStarGui:
         tk.Label(zbar, textvariable=self.cursor, width=22, anchor="w"
                  ).pack(side="left", padx=8)
 
+        # live readout of the mechanism at the pose shown (update_readout())
+        self.readout = tk.StringVar(value="")
+        tk.Label(root, textvariable=self.readout, anchor="w", font=("TkFixedFont", 9)
+                 ).pack(fill="x", padx=8, pady=(4, 0))
+
         mbar = tk.Frame(root)
         mbar.pack(fill="x", padx=8, pady=(6, 0))
         tk.Label(mbar, text="Machine host:").pack(side="left")
@@ -186,9 +238,9 @@ class AStarGui:
         self.connect_btn.pack(side="left", padx=2)
         tk.Label(mbar, text="Speed (cm/s):").pack(side="left", padx=(12, 0))
         self.speed = tk.DoubleVar(value=DEFAULT_SPEED_CM_S)
-        tk.Spinbox(mbar, from_=0.5, to=20, increment=0.5, width=5,
+        tk.Spinbox(mbar, from_=0.5, to=100, increment=0.5, width=5,
                    textvariable=self.speed).pack(side="left", padx=4)
-        self.send_btn = tk.Button(mbar, text="Send path to machine",
+        self.send_btn = tk.Button(mbar, text="Send path (simulate if not connected)",
                                   command=self.send_path)
         self.send_btn.pack(side="left", padx=(12, 2))
         tk.Button(mbar, text="STOP", fg="white", bg="#c03030",
@@ -203,7 +255,8 @@ class AStarGui:
         self.view.pack(side="left", padx=(8, 0))
 
         self.canvas.bind("<ButtonPress-1>", self.on_press)
-        self.canvas.bind("<B1-Motion>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Motion>", self.on_motion)
         self.view.bind("<ButtonPress-1>", self.on_view_press)
         self.view.bind("<B1-Motion>", self.on_view_drag)
@@ -217,7 +270,8 @@ class AStarGui:
             value=f"Moveable area {d.move_x:g} x {d.move_y:g} cm, lift z 0 to "
                   f"{d.move_z:g}, {RESOLUTION_CM:g} cm resolution. Start is "
                   "the mechanism's actual pose. Click the map to set a Goal, "
-                  "then Run A*.")
+                  "then Run A*. While a box is on the lift, clicking or "
+                  "dragging on the map places it.")
         tk.Label(root, textvariable=self.status, anchor="w", justify="left",
                  wraplength=1060).pack(fill="x", padx=8, pady=8)
 
@@ -244,12 +298,15 @@ class AStarGui:
             while True:
                 kind, val = self.events.get_nowait()
                 if kind == "pose":
-                    self.arena.move_to(*val)
+                    self.show_pose(*val)
                     moved = True
                 elif kind == "done":
+                    msg, arrived = val
                     self.running = False
                     self.send_btn.config(state="normal")
-                    self.status.set(val)
+                    if arrived is not None:
+                        self.arrive(*arrived)
+                    self.status.set(msg)
                 else:                 # a "#" line from the firmware
                     self.logbox.config(state="normal")
                     self.logbox.insert("end", val + "\n")
@@ -302,29 +359,86 @@ class AStarGui:
         if not self.path:
             self.status.set("Run A* first - there is no path to send.")
             return
-        if not self.link.connected:
-            self.status.set("Connect to the machine first.")
-            return
-        path, speed = list(self.path), self.speed.get()
+        # captured now: clicking the map while it runs clears these
+        path, speed, rule = list(self.path), self.speed.get(), self.path_rule
+        arrived = (self.on_arrival, self.path[-1])
         self.running = True
         self.send_btn.config(state="disabled")
+        if not self.link.connected:
+            self.simulate(path, speed, rule, arrived)
+            return
         self.status.set("Following the path... (STOP aborts)")
+        # followed in two parts, split where the pick/drop sequence starts,
+        # so the box can be shown held still through it (show_pose())
+        r = rule[0] if rule else len(path) - 1
 
         def work():
             try:
-                self.link.follow(path, speed,
-                                 progress=lambda p: self.events.put(("pose", p)))
-                self.events.put(("done", "Arrived at the goal."))
+                for part, k in ((path[:r + 1], None), (path[r:], r)):
+                    if len(part) >= 2:
+                        self.link.follow(part, speed, progress=lambda p, k=k:
+                                         self.events.put(("pose", (p, rule, k))))
+                self.events.put(("done", ("Arrived at the goal.", arrived)))
             except LinkError as e:
-                self.events.put(("done", f"Path not completed: {e}"))
+                self.events.put(("done", (f"Path not completed: {e}", None)))
             except Exception:         # a bug must not leave the GUI "following" forever
                 self.events.put(("log", traceback.format_exc()))
-                self.events.put(("done", "Path aborted by an internal error - see the "
-                                         "controller messages below."))
+                self.events.put(("done", ("Path aborted by an internal error - see the "
+                                          "controller messages below.", None)))
                 self.link.stop()
         threading.Thread(target=work, daemon=True).start()
 
+    def simulate(self, path, speed, rule, arrived):
+        """Not connected: play the path back on screen at `speed`, then treat
+        it as run (arrive()), the same as the machine finishing it."""
+        step = max(speed, 0.1) * 0.05          # cm per 50 ms frame
+        poses = []
+        for j, (a, b) in enumerate(zip(path, path[1:]), start=1):
+            n = max(1, math.ceil(math.dist(a, b) / step))
+            poses += [(tuple(a[i] + (b[i] - a[i]) * k / n for i in range(3)), j)
+                      for k in range(1, n + 1)]
+        frames = iter(poses)
+        self.status.set("Not connected - simulating the path... (STOP aborts)")
+
+        def tick():
+            if not self.running:               # STOP
+                return
+            f = next(frames, None)
+            if f is None:
+                self.events.put(("done", ("Simulated path finished.", arrived)))
+                return
+            self.show_pose(f[0], rule, f[1])
+            self.draw()
+            self.root.after(50, tick)
+        tick()
+
+    def arrive(self, on_arrival, end):
+        """A path has been run to its end: apply what it did (picked up or
+        dropped a box, see run()), and - when not connected, so nothing
+        else reports the pose - make its end the new Start. The path and
+        Goal are used up."""
+        if not self.link.connected:
+            self.start = end
+        self.arena.box_override = None
+        if on_arrival is not None:
+            on_arrival()
+        self.reset_goal()
+        self.arena.move_to(*self.start)
+        self.draw()
+
     def stop_machine(self):
+        if self.running and not self.link.connected:   # stop the simulation
+            self.running = False
+            self.send_btn.config(state="normal")
+            self.arena.box_override = None
+            d = self.arena.dims
+            # on the lattice, like every other Start (plan_path snaps to it)
+            self.start = tuple(snap(v, 0.0, hi) for v, hi in
+                               zip(self.arena.pos, (d.move_x, d.move_y, d.move_z)))
+            self.status.set("Simulation stopped - Start is where it stopped. A pick "
+                            "or drop it didn't finish has not happened.")
+            self.draw()
+            return
         if self.link.connected:
             try:
                 self.link.stop()
@@ -346,6 +460,11 @@ class AStarGui:
         y = self.wy1 - event.y / PX
         return snap(x, 0.0, d.move_x), snap(y, 0.0, d.move_y)
 
+    def raw_cm_at(self, event):
+        """Map pixel -> (x, y) cm, not snapped or limited to the moveable
+        area (a carried box can sit outside it)."""
+        return event.x / PX + self.wx0, self.wy1 - event.y / PX
+
     # ---- pose helpers ---------------------------------------------------
 
     def in_collision(self, point, ignore=None):
@@ -362,10 +481,23 @@ class AStarGui:
         self.arena.pos[:] = saved
         return hit
 
+    def show_pose(self, p, rule=None, k=None):
+        """Put the mechanism at `p`, the pose on the way to path point k.
+        `rule` is (first path index, box name, box) for a path ending in a
+        pick or drop sequence: from that index on, the box sits still at
+        `box` - it isn't on the lift until the pick sequence has finished,
+        and is off it as soon as it has been set down."""
+        self.arena.box_override = (rule[1:] if rule and k is not None and k >= rule[0]
+                                   else None)
+        self.arena.move_to(*p)
+
     def invalidate(self):
+        self.arena.box_override = None
+        self.path_rule = None
         self.path = []
         self.path_ignore = []  # parallel to self.path: a solid name to excuse
                                 # from that point's collision check, or None
+        self.on_arrival = None
         self.explored = set()
         self.scrub.config(state="disabled", to=0)
         self.scrub.set(0)
@@ -378,7 +510,8 @@ class AStarGui:
 
     def box_offset_point(self, box, offset):
         """The tool point that puts the plate's lift point `offset` cm out
-        from `box`'s lift point, along the box's back face normal (+y):
+        from `box`'s lift point (`box` a Solid: its type sets the lift
+        height), along the box's back face normal (+y):
         offset 0 is the plate touching the box, positive backs off from it."""
         d = self.arena.dims
         lx, ly, lz = self.arena.box_lift_point(box)
@@ -431,20 +564,32 @@ class AStarGui:
         for o in self.arena.obstacles:
             b = o.box
             if b[0] <= x <= b[3] and b[1] <= y <= b[4]:
-                return o, self.box_goal_point(b)
+                return o, self.box_goal_point(o)
         return None
 
-    def set_goal(self, point, box=None):
+    def set_goal(self, point, box=None, place=None):
         """Common tail for setting the Goal from either view: update state,
-        check for collision there, and report status."""
+        check for collision there, and report status. `box`: a box to go
+        and pick up. `place`: the tool point that sets the carried box down
+        where set_place_goal() worked out (`point` is then the approach
+        just above it)."""
+        if box is not None and self.arena.carried is not None:
+            self.status.set(f"Place {self.arena.carried[0].name} (drag it on the "
+                            "map) before picking up another box.")
+            return
         self.goal = point
         self.target_box = box
         if box is not None:
-            self.final_point = self.box_exact_point(box.box)
+            self.final_point = self.box_exact_point(box)
             self.final_sequence = self.sequence_for(box.kind)
+        elif place is not None:
+            self.final_point = place
+            self.final_sequence = []
         else:
             self.final_point = point
             self.final_sequence = []
+        if place is None:
+            self.place_box = None
         self.invalidate()
         self.arena.move_to(*point)  # show the mechanism where it was put
         hits = self.arena.collisions()
@@ -454,13 +599,167 @@ class AStarGui:
         elif box is not None:
             self.status.set(f"Goal set to lift {box.name} - carriage "
                             f"({point[0]:g}, {point[1]:g}), lift z {point[2]:g}.")
+        elif place is not None:
+            b = self.place_box
+            self.status.set(f"Goal set to place {self.arena.carried[0].name} at "
+                            f"({b[0]:g}, {b[1]:g}), resting at z {b[2]:g} - carriage "
+                            f"({place[0]:g}, {place[1]:g}), lift z {place[2]:g}.")
         else:
             self.status.set(f"Goal set to ({point[0]:g}, {point[1]:g}, {point[2]:g}).")
         self.draw()
 
+    def carried_place_box(self, x0, y0):
+        """Where the carried box ends up if set down with its corner nearest
+        the origin at (x0, y0): on the nearest surface below it - the top
+        of the highest box under that footprint, or the floor."""
+        off = self.arena.carried[1]
+        x1, y1 = x0 + off[3] - off[0], y0 + off[4] - off[1]
+        z0 = self.arena.support_height(x0, y0, x1, y1)
+        return (x0, y0, z0, x1, y1, z0 + off[5] - off[2])
+
+    def set_place_goal(self, x0, y0):
+        """Aim to set the carried box down at carried_place_box(x0, y0).
+        The Goal A* plans to is above that spot by a bit more than the
+        clearance, since (like box_goal_point()) the resting place itself is
+        inside the clearance-grown floor/support; run() lowers it the rest
+        of the way and drops it (append_place())."""
+        a, d = self.arena, self.arena.dims
+        box = self.carried_place_box(x0, y0)
+        self.place_box = box
+        self.goal = None
+        self.invalidate()
+        clash = a.overlapping(box)
+        if clash:
+            self.status.set("Can't place it there - it would overlap " + ", ".join(clash) + ".")
+            self.draw()
+            return
+        off = a.carried[1]
+        place = tuple(box[i] - off[i] for i in range(3))   # box bottom on the surface
+        if any(not -1e-9 <= v <= hi + 1e-9 for v, hi in zip(place, (d.move_x, d.move_y, d.move_z))):
+            self.status.set("Can't place it there - out of the carriage's reach (it "
+                            f"would need tool point {place[0]:g}, {place[1]:g}, "
+                            f"{place[2]:g}).")
+            self.draw()
+            return
+        try:
+            clearance = max(0.0, self.clearance.get())
+        except tk.TclError:
+            clearance = 0.5
+        above = (place[0], place[1],
+                 min(max(place[2], box[2] - off[2] + clearance + RESOLUTION_CM), d.move_z))
+        self.set_goal(above, place=place)
+
+    def on_lift_height(self, kind):
+        """A lift height was edited: use it for every box of that type from
+        now on. A Goal aimed at a box is aimed afresh, since its lift point
+        moved; a half-typed value that isn't a number is ignored."""
+        try:
+            h = float(self.lift_height[kind].get())
+        except (ValueError, tk.TclError):
+            return
+        if h < 0 or h == self.arena.lift_height(kind):
+            return
+        self.arena.lift_heights[kind] = h
+        if self.target_box is not None and self.target_box.kind == kind and not self.running:
+            self.set_goal(self.box_goal_point(self.target_box), self.target_box)
+        else:
+            self.draw()
+
+    def load_on_lift(self):
+        """Put a new box of the chosen type on the lift, where a finished
+        pick would have left it with the lift at Start: that type's pick
+        sequence, undone from Start, gives the contact pose, where the
+        plate's lift point is on the box's lift point. For a box that's
+        already on the real lift, or to try a place without a pick first."""
+        kind = self.load_kind.get()
+        if self.running:
+            self.status.set("A path is running - wait for it or press STOP first.")
+            return
+        if self.arena.carried is not None:
+            self.status.set(f"{self.arena.carried[0].name} is already on the lift.")
+            return
+        self.sync_start()
+        seq = self.sequence_for(kind)
+        contact = list(self.start)
+        for axis, delta in seq:
+            contact[axis] -= delta
+        lx, ly, lz = self.arena.plate_lift_point(*contact)
+        w, dp, h = BOX_TYPES[kind]
+        # on the lattice, like every box a real pick lifts (which is why the
+        # plate's own lift point may sit a hair off the box's)
+        x0, y1, z0 = (snap(v, -1e6, 1e6) for v in (lx - w / 2, ly, lz - self.arena.lift_height(kind)))
+        taken = {o.name for o in self.arena.obstacles}
+        n = 1
+        while f"{kind} box {n}" in taken:
+            n += 1
+        box = Solid(f"{kind} box {n}", (x0, y1 - dp, z0, x0 + w, y1, z0 + h), kind)
+        clash = self.arena.overlapping(box.box)
+        if clash:
+            self.status.set(f"No room for a {kind} box on the lift here - it would "
+                            f"overlap {', '.join(clash)}. Move the lift first.")
+            return
+        self.reset_goal()
+        self.engaged_box, self.engaged_sequence, self.engaged_steps = None, [], 0
+        self.arena.carry(box, self.start)
+        self.carry_sequence, self.carry_origin = seq, None
+        self.arena.move_to(*self.start)
+        self.status.set(f"{box.name} is on the lift - click or drag on the map to place it.")
+        self.draw()
+
+    def remove_all_boxes(self):
+        """Empty the arena: every box, including one on the lift."""
+        if self.running:
+            self.status.set("A path is running - wait for it or press STOP first.")
+            return
+        self.reset_goal()
+        self.engaged_box, self.engaged_sequence, self.engaged_steps = None, [], 0
+        self.arena.obstacles.clear()
+        self.arena.carried = None
+        self.carry_sequence, self.carry_origin = [], None
+        self.arena.move_to(*self.start)
+        self.status.set("Removed all boxes.")
+        self.draw()
+
+    def place_here(self):
+        """Give up on moving the carried box: set it down right where it is
+        (on the surface under it) and plan that - lower it, then the drop
+        sequence - ready to Send."""
+        if self.arena.carried is None:
+            self.status.set("No box on the lift to place.")
+            return
+        if self.running:
+            self.status.set("The path is still running - press STOP first, then Place box here.")
+            return
+        self.sync_start()
+        b = self.arena.carried_solid(*self.start).box
+        self.set_place_goal(snap(b[0], -1e6, 1e6), snap(b[1], -1e6, 1e6))
+        if self.goal is not None:
+            self.run()
+
+    def carried_footprint(self):
+        """(x0, y0, x1, y1) to grab to drag the carried box: its place
+        ghost if it has one, else the carried box itself."""
+        b = self.place_box or self.arena.carried_solid(*self.arena.pos).box
+        return b[0], b[1], b[3], b[4]
+
     def on_press(self, event):
-        x, y = self.cm_at(event)
+        if self.running:
+            return
         self.on_motion(event)
+        self._drag = None
+        if self.arena.carried is not None:
+            # carrying a box, every click places it: grab the box (or its
+            # place outline) to drag it, or click anywhere to put it there,
+            # centred on the click (and keep dragging from there)
+            rx, ry = self.raw_cm_at(event)
+            x0, y0, x1, y1 = self.carried_footprint()
+            if x0 <= rx <= x1 and y0 <= ry <= y1:
+                self._drag = (x0 - rx, y0 - ry)   # grab offset to the box corner
+            else:
+                self._drag = ((x0 - x1) / 2, (y0 - y1) / 2)
+                self.on_drag(event)
+            return
+        x, y = self.cm_at(event)
         box_hit = self.goal_for_box(x, y)
         if box_hit is not None:
             box, point = box_hit
@@ -468,20 +767,51 @@ class AStarGui:
             box, point = None, (x, y, snap(self.z.get(), 0.0, self.arena.dims.move_z))
         self.set_goal(point, box)
 
+    def on_drag(self, event):
+        if self.running:
+            return
+        if self._drag is None:
+            self.on_press(event)
+            return
+        self.on_motion(event)
+        rx, ry = self.raw_cm_at(event)
+        self.place_box = self.carried_place_box(
+            round((rx + self._drag[0]) / RESOLUTION_CM) * RESOLUTION_CM,
+            round((ry + self._drag[1]) / RESOLUTION_CM) * RESOLUTION_CM)
+        self.goal = None
+        self.invalidate()
+        self.draw_map()               # the ghost follows the mouse; 3D on release
+
+    def on_release(self, event):
+        if self._drag is None or self.running:
+            return
+        self._drag = None
+        if self.place_box is not None:
+            self.set_place_goal(self.place_box[0], self.place_box[1])
+
     def on_scrub(self, value):
         if self.path:
-            self.arena.move_to(*self.path[int(float(value))])
+            i = int(float(value))
+            self.show_pose(self.path[i], self.path_rule, i)
             self.draw()
 
     def run(self):
+        self.arena.box_override = None   # plan with the boxes where they really are
+        self.path_rule = None
         self.sync_start()
         self.infer_engagement()
         if self.goal is None:
             self.status.set("Set a Goal first.")
             return
         for name, p in (("Start", self.start), ("Goal", self.goal)):
-            if self.in_collision(p, ignore=self.engaged_box.name if self.engaged_box else None):
-                self.status.set(f"{name} is in collision with a box, so no "
+            ignore = self.engaged_box.name if self.engaged_box else None
+            if self.in_collision(p, ignore=ignore):
+                saved = list(self.arena.pos)
+                self.arena.move_to(*p)
+                hits = sorted({h for pair in self.arena.collisions() if ignore not in pair
+                               for h in pair[1:]})
+                self.arena.pos[:] = saved
+                self.status.set(f"{name} is in collision with {', '.join(hits)}, so no "
                                 "path can start or end there. Move it.")
                 return
         self.status.set("Planning...")
@@ -493,10 +823,18 @@ class AStarGui:
         except tk.TclError:
             clearance = 0.5
         plan_start, prepend_pts, prepend_ignore = self.plan_start_and_prepend(clearance)
-        self.path = plan_path(
-            self.arena, plan_start, self.goal, diagonals=self.diagonals.get(),
-            explored=self.explored if self.show_explored.get() else None,
-            clearance=clearance)
+        try:
+            self.path = plan_path(
+                self.arena, plan_start, self.goal, diagonals=self.diagonals.get(),
+                explored=self.explored if self.show_explored.get() else None,
+                clearance=clearance, timeout=PLAN_TIMEOUT_S)
+        except PlanningTimeout:
+            self.path = []
+            self.status.set(f"Planning timed out after {PLAN_TIMEOUT_S:g} s without "
+                            "finding a path - try a different Goal, or lower the "
+                            "Clearance.")
+            self.draw()
+            return
         # the lattice staircase makes the motors wiggle: pull it into straight runs
         self.path = smooth_path(self.arena, self.path, clearance=clearance)
         if self.path:
@@ -505,20 +843,10 @@ class AStarGui:
                 self.path = prepend_pts + self.path
                 self.path_ignore = prepend_ignore + self.path_ignore
         sequence_note = ""
-        if self.path:
-            reached_box, steps_done = self.append_final_contact()
-            if self.target_box is not None and reached_box:
-                self.engaged_box = self.target_box
-                self.engaged_sequence = self.final_sequence
-                self.engaged_steps = steps_done
-            else:
-                self.engaged_box, self.engaged_sequence, self.engaged_steps = None, [], 0
-            if not reached_box:
-                sequence_note = " Couldn't reach the box itself - something's in the way."
-            elif self.final_sequence and steps_done < len(self.final_sequence):
-                sequence_note = (f" Stopped after step {steps_done + 1} of "
-                                 f"{len(self.final_sequence)} in the pick "
-                                 "sequence - blocked.")
+        if self.path and self.place_box is not None:
+            sequence_note = self.finish_place_path()
+        elif self.path:
+            sequence_note = self.finish_pick_path()
         dt = time.time() - t
         if self.path:
             length = sum(math.dist(a, b) for a, b in zip(self.path, self.path[1:]))
@@ -531,10 +859,141 @@ class AStarGui:
                             f"through it.{sequence_note}")
             self.scrub.config(state="normal", to=len(self.path) - 1)
             self.scrub.set(0)
-            self.arena.move_to(*self.path[0])
+            self.show_pose(self.path[0], self.path_rule, 0)
         else:
             self.status.set(f"No path found ({dt:.1f} s).")
         self.draw()
+
+    def finish_pick_path(self):
+        """Tail of run() for any Goal but a place: append the contact and
+        pick sequence (append_final_contact()), and set self.on_arrival to
+        what the path leaves engaged once it has run. A box whose whole
+        pick sequence ran is then on the lift (Arena.attach()). Returns a
+        note for the status bar."""
+        box, seq = self.target_box, self.final_sequence
+        reached_box, steps_done = self.append_final_contact()
+        end = self.path[-1]
+        on_top = [] if box is None else [
+            o.name for o in self.arena.obstacles
+            if abs(o.box[2] - box.box[5]) < 1e-9 and o.box[0] < box.box[3]
+            and box.box[0] < o.box[3] and o.box[1] < box.box[4] and box.box[1] < o.box[4]]
+        carries = (box is not None and reached_box and steps_done == len(seq)
+                   and box.kind in BOX_TYPES and not on_top)
+        if box is not None and reached_box:
+            # the box sits still through the pick sequence (the plate may
+            # overlap it); it goes onto the lift only once that is finished
+            self.path_rule = (len(self.path) - 1 - steps_done, box.name, box.box)
+
+        def on_arrival():
+            self.engaged_box, self.engaged_sequence, self.engaged_steps = None, [], 0
+            if box is None or not reached_box:
+                return
+            if carries:
+                self.carry_origin = box
+                self.carry_sequence = seq
+                self.arena.attach(box.name, end)
+            else:
+                self.engaged_box, self.engaged_sequence, self.engaged_steps = box, seq, steps_done
+        self.on_arrival = on_arrival
+
+        if not reached_box:
+            return " Couldn't reach the box itself - something's in the way."
+        if seq and steps_done < len(seq):
+            return (f" Stopped after step {steps_done + 1} of {len(seq)} in the pick "
+                    "sequence - blocked, so the box won't be picked up.")
+        if on_top:
+            return (f" {box.name} has {', '.join(on_top)} on top, so it won't be "
+                    "picked up - move that first.")
+        if carries:
+            return f" Once run, {box.name} is on the lift - click or drag on the map to place it."
+        return ""
+
+    def finish_place_path(self):
+        """Tail of run() for a place Goal: append the set-down and drop
+        (append_place()), and set self.on_arrival to leave the box where it
+        was put, off the lift, with the plate engaged by whatever of the
+        drop didn't run. Returns a note for the status bar."""
+        box, seq = self.place_box, self.drop_pick_sequence()
+        kind = self.arena.carried[0].kind
+        placed, drop_done = self.append_place(seq)
+
+        def on_arrival():
+            if not placed:
+                return                     # never got down there: still carrying it
+            self.engaged_box = self.arena.release(box)
+            self.engaged_sequence, self.engaged_steps = seq, len(seq) - drop_done
+            self.carry_sequence, self.carry_origin, self.place_box = [], None, None
+        self.on_arrival = on_arrival
+
+        if not placed:
+            return " Couldn't lower the box into place - something's in the way."
+        if drop_done < len(seq):
+            return (f" Stopped after step {drop_done + 1} of {len(seq)} in the drop "
+                    "sequence - blocked.")
+        if not seq:
+            return (f" No pick sequence is set for '{kind}', so there is no drop "
+                    "sequence to run - once run, the box is just let go.")
+        return (f" Once run, the box is set down and the {len(seq)}-step drop "
+                "sequence takes the plate off it.")
+
+    def drop_pick_sequence(self):
+        """The pick sequence whose reverse drops the carried box: the one
+        that picked it up, or - if that was empty, say it was only filled
+        in afterwards - the one set for its box type now."""
+        return self.carry_sequence or self.sequence_for(self.arena.carried[0].kind)
+
+    def append_steps(self, p, steps, ignore):
+        """Append the relative moves `steps` ((axis, delta) pairs) to
+        self.path, from `p`, each checked by the real geometry with
+        straight_clear(ignore=ignore). Stops at the first blocked one and
+        returns how many were appended."""
+        d = self.arena.dims
+        limits = (d.move_x, d.move_y, d.move_z)
+        for i, (axis, delta) in enumerate(steps):
+            nxt = list(p)
+            nxt[axis] = snap(nxt[axis] + delta, 0.0, limits[axis])
+            nxt = tuple(nxt)
+            if not self.straight_clear(p, nxt, ignore=ignore):
+                return i
+            self.path.append(nxt)
+            self.path_ignore.append(ignore)
+            p = nxt
+        return len(steps)
+
+    def append_place(self, seq):
+        """The place counterpart of append_final_contact(): from the Goal
+        just above the spot, lower the carried box straight down until the
+        next step would collide. That has to be the box's bottom meeting
+        the surface under it (self.place_box); if anything else stops it
+        first, or the lift bottoms out, it isn't placed. Then, with the box
+        sitting still there, run the pick sequence `seq` in reverse to drop
+        it (reverse_sequence()).
+
+        Returns (placed, drop_done): placed is False if it couldn't be
+        lowered onto the surface (the path is left above the spot, box
+        still on the lift); drop_done is how many drop steps ran."""
+        p = self.path[-1]
+        while p[2] - RESOLUTION_CM >= -1e-9:
+            nxt = (p[0], p[1], round((p[2] - RESOLUTION_CM) / RESOLUTION_CM) * RESOLUTION_CM)
+            if self.in_collision(nxt):
+                break
+            p = nxt
+        name, off = self.arena.carried[0].name, self.arena.carried[1]
+        if abs(p[2] + off[2] - self.place_box[2]) > 1e-6:
+            return False, 0        # stopped by something else, or never reached the surface
+        if p != self.path[-1]:
+            self.path.append(p)
+            self.path_ignore.append(None)
+        # from here the box sits still on the surface while the plate
+        # leaves it; the drop is checked against it there - the plate may
+        # touch it, nothing else may
+        self.path_rule = (len(self.path) - 1, name, self.place_box)
+        self.arena.box_override = (name, self.place_box)
+        try:
+            done = self.append_steps(p, reverse_sequence(seq), name)
+        finally:
+            self.arena.box_override = None
+        return True, done
 
     def straight_clear(self, a, b, ignore=None):
         """True if the straight segment a-b is collision-free by the real,
@@ -551,10 +1010,12 @@ class AStarGui:
             tuple(a[i] + (b[i] - a[i]) * k / steps for i in range(3)), ignore=ignore)
             for k in range(1, steps + 1))
 
-    def escape_start(self, clearance, ignore=None):
+    def escape_start(self, clearance, ignore=None, dirs=((0, 1, 0),)):
         """self.start, or - if it's blocked only by the clearance grown
-        around an obstacle - the nearest point out along +y (every box's
-        pickup face) that clears that grown region, so plan_path() has a
+        around an obstacle - the nearest point out along one of the
+        directions `dirs`, tried in order at each distance (default +y,
+        every box's pickup face; carrying a box, +z first to lift it off
+        whatever it rests on) that clears that grown region, so plan_path() has a
         reachable point to search from instead of one sitting deep inside a
         blocked region it can never step out of. The fallback for when
         there's no tracked engagement to reverse, or disengage_start()
@@ -576,14 +1037,18 @@ class AStarGui:
         obstacles = BoxObstacles(self.arena.configuration_boxes(clearance), RESOLUTION_CM)
         if cm_to_node(self.start) not in obstacles:
             return self.start
-        p = list(self.start)
-        while p[1] < d.move_y:
-            p[1] = min(p[1] + RESOLUTION_CM, d.move_y)
-            pt = tuple(p)
-            if self.in_collision(pt, ignore=ignore):
-                break   # something else is in the way; give up escaping
-            if cm_to_node(pt) not in obstacles:
-                return pt
+        limits = (d.move_x, d.move_y, d.move_z)
+        alive = list(dirs)   # directions not yet stopped by a limit or a collision
+        k = 0
+        while alive:
+            k += 1
+            for v in list(alive):
+                pt = tuple(self.start[i] + v[i] * k * RESOLUTION_CM for i in range(3))
+                if (any(not -1e-9 <= pt[i] <= limits[i] + 1e-9 for i in range(3))
+                        or self.in_collision(pt, ignore=ignore)):
+                    alive.remove(v)   # off the travel, or something else is in the way
+                elif cm_to_node(pt) not in obstacles:
+                    return pt
         return self.start   # couldn't find a way clear; plan_path will report it
 
     def infer_engagement(self):
@@ -597,7 +1062,7 @@ class AStarGui:
         type's pick sequence in full would leave. That both stops it being
         reported as "Start is in collision" and gives disengage_start()
         something to reverse before planning a move away from it."""
-        if self.engaged_box is not None:
+        if self.engaged_box is not None or self.arena.carried is not None:
             return
         saved = list(self.arena.pos)
         self.arena.move_to(*self.start)
@@ -644,7 +1109,7 @@ class AStarGui:
             pts.append(nxt)
             ignore.append(name)
             p = nxt
-        standoff = self.box_offset_point(box.box, clearance + RESOLUTION_CM)
+        standoff = self.box_offset_point(box, clearance + RESOLUTION_CM)
         if not self.straight_clear(p, standoff):
             return None
         return standoff, pts, ignore
@@ -655,7 +1120,16 @@ class AStarGui:
         to the resulting path to bridge from self.start to it. Tries
         disengage_start() first - exact, since it retraces the engagement
         that put self.start where it is - then falls back to
-        escape_start()'s blind step along +y."""
+        escape_start()'s blind step along +y. Carrying a box, it just lifts
+        it clear (+z) - reversing the pick sequence would drop it."""
+        if self.arena.carried is not None:
+            # up first; if the carriage is too near the face of the box it
+            # was lifted off, which it fills the full height beside, going
+            # up alone never clears it - so then up and back, then back
+            plan_start = self.escape_start(clearance, dirs=((0, 0, 1), (0, 1, 1), (0, 1, 0)))
+            if plan_start == self.start:
+                return plan_start, [], []
+            return plan_start, [self.start], [None]
         out = self.disengage_start(clearance)
         if out is not None:
             return out
@@ -697,27 +1171,27 @@ class AStarGui:
                 return False, 0   # can't even reach the box; left at the standoff
             self.path.append(target)
             self.path_ignore.append(ignore)
-        d = self.arena.dims
-        limits = (d.move_x, d.move_y, d.move_z)
-        p = target
-        for i, (axis, delta) in enumerate(self.final_sequence):
-            nxt = list(p)
-            nxt[axis] = snap(nxt[axis] + delta, 0.0, limits[axis])
-            nxt = tuple(nxt)
-            if not self.straight_clear(p, nxt, ignore=ignore):
-                return True, i   # this step is blocked; stop the sequence here
-            self.path.append(nxt)
-            self.path_ignore.append(ignore)
-            p = nxt
-        return True, len(self.final_sequence)
+        return True, self.append_steps(target, self.final_sequence, ignore)
 
-    def clear(self):
+    def reset_goal(self):
         self.goal = None
         self.target_box = None
         self.final_point = None
         self.final_sequence = []
-        self.engaged_box, self.engaged_sequence, self.engaged_steps = None, [], 0
+        self.place_box = None
         self.invalidate()
+
+    def clear(self):
+        self.reset_goal()
+        self.engaged_box, self.engaged_sequence, self.engaged_steps = None, [], 0
+        if self.arena.carried is not None and not self.link.connected:
+            # simulated pick: put the box back where it came from - or, if
+            # it was loaded straight onto the lift, take it away
+            if self.carry_origin is not None:
+                self.arena.release(self.carry_origin.box)
+            else:
+                self.arena.carried = None
+            self.carry_sequence, self.carry_origin = [], None
         self.arena.home()
         if not self.sync_start():        # not connected: Start is the home pose
             self.start = tuple(self.arena.pos)
@@ -786,24 +1260,52 @@ class AStarGui:
     def pick_in_view(self, sx, sy):
         """A click in the 3D view: snap to a box's lift point if the click
         landed near its marker, otherwise aim at the floor under the
-        cursor (at the current Lift z), the 3D equivalent of clicking the
-        2D map."""
+        cursor (at the current Lift z) - or, carrying a box, place it
+        there - the 3D equivalent of clicking the 2D map."""
         for o in self.arena.obstacles:
-            mx, my, _ = self.project(*self.arena.box_lift_point(o.box))
+            mx, my, _ = self.project(*self.arena.box_lift_point(o))
             if (mx - sx) ** 2 + (my - sy) ** 2 <= 64:   # within 8 px
-                self.set_goal(self.box_goal_point(o.box), o)
+                self.set_goal(self.box_goal_point(o), o)
                 return
         d = self.arena.dims
         x, y = self.unproject(sx, sy, 0.0)
+        if self.arena.carried is not None:   # place the carried box, centred there
+            off = self.arena.carried[1]
+            self.set_place_goal(snap(x - (off[3] - off[0]) / 2, -1e6, 1e6),
+                                snap(y - (off[4] - off[1]) / 2, -1e6, 1e6))
+            return
         point = (snap(x, 0.0, d.move_x), snap(y, 0.0, d.move_y),
                  snap(self.z.get(), 0.0, d.move_z))
         self.set_goal(point)
 
     # ---- drawing --------------------------------------------------------
 
+    def shown_hit_names(self):
+        """Names of everything to draw red: what the mechanism overlaps at
+        the current pose, except the box a pick/drop sequence is lifting or
+        setting down (box_override), which the plate is meant to engage."""
+        a = self.arena
+        ok = a.box_override[0] if a.box_override else None
+        return {n for pair in a.collisions() if ok not in pair for n in pair}
+
     def draw(self):
+        self.update_readout()
         self.draw_map()
         self.draw3d()
+
+    def update_readout(self):
+        """Readout of the pose the views show: the tool point, and heights
+        above the arena floor of the lift plate (the orange one) and of the
+        bottom of a box on the lift."""
+        a = self.arena
+        x, y, z = a.pos
+        plate = a.plate_box(x, y, z)
+        text = (f"Tool x {x:7.2f}  y {y:7.2f}  lift z {z:6.2f} cm    "
+                f"Plate above floor: underside {plate[2]:6.2f}  top {plate[5]:6.2f} cm")
+        carried = a.carried_solid(x, y, z)
+        if carried and not (a.box_override and a.box_override[0] == carried.name):
+            text += f"    {carried.name} bottom above floor {carried.box[2]:6.2f} cm"
+        self.readout.set(text)
 
     def draw_map(self):
         c = self.canvas
@@ -824,10 +1326,17 @@ class AStarGui:
         for gy in range(0, int(iy1) + 1, 10):
             c.create_line(self.sx(ix0), self.sy(gy), self.sx(ix1), self.sy(gy), fill="#2b2b2b")
         c.create_rectangle(self.sx(0), self.sy(d.move_y), self.sx(d.move_x), self.sy(0),
-                           outline="#4a7db5", dash=(4, 3))
+                           outline=LIMIT_COLOR, dash=(4, 3))
+        # the overhead wall: hatched, since only a plate or box that's
+        # high enough hits it
+        b = a.overhead_wall().box
+        c.create_rectangle(self.sx(b[0]), self.sy(b[4]), self.sx(b[3]), self.sy(b[1]),
+                           fill="#6b6b6b", stipple="gray50", outline="#8a8a8a")
+        c.create_text(self.sx(ix1) - 4, self.sy(b[1]) + 2, anchor="ne", fill="#9a9a9a",
+                      text=f"overhead wall, z {b[2]:g} and up", font=("TkDefaultFont", 7))
 
         # boxes, lowest first so stacked boxes draw on top of what they sit on
-        for o in sorted(a.obstacles, key=lambda o: o.box[2]):
+        for o in sorted(a.boxes(), key=lambda o: o.box[2]):
             b = o.box
             c.create_rectangle(self.sx(b[0]), self.sy(b[4]), self.sx(b[3]), self.sy(b[1]),
                                fill=KIND_COLOR.get(o.kind, "#8a6a3a"), outline="#d8d8d8")
@@ -848,17 +1357,27 @@ class AStarGui:
                 c.create_oval(px - r, py - r, px + r, py + r, fill=color, outline="white")
 
         # the mechanism at its current pose
-        hits = a.collisions()
-        hit_names = {n for pair in hits for n in pair}
+        hit_names = self.shown_hit_names()
         for sol in a.moving_solids():
             b = sol.box
             c.create_rectangle(self.sx(b[0]), self.sy(b[4]), self.sx(b[3]), self.sy(b[1]),
-                               fill=HIT_COLOR if sol.name in hit_names else KIND_COLOR[sol.kind],
+                               fill=HIT_COLOR if sol.name in hit_names
+                               else KIND_COLOR.get(sol.kind, "#8a6a3a"),
                                outline="white", stipple="gray50" if sol.kind == "carriage" else "")
 
+        # where the carried box is being placed: red if it can't go there
+        if self.place_box is not None:
+            b = self.place_box
+            c.create_rectangle(self.sx(b[0]), self.sy(b[4]), self.sx(b[3]), self.sy(b[1]),
+                               outline=PLACE_COLOR if self.goal else HIT_COLOR,
+                               width=2, dash=(5, 3))
+            c.create_text((self.sx(b[0]) + self.sx(b[3])) / 2,
+                          (self.sy(b[1]) + self.sy(b[4])) / 2,
+                          text=f"{b[5]:g}", fill=PLACE_COLOR, font=("TkDefaultFont", 8))
+
         # lift points
-        for o in a.obstacles:
-            lx, ly, _ = a.box_lift_point(o.box)
+        for o in a.boxes():
+            lx, ly, _ = a.box_lift_point(o)
             px, py, r = self.sx(lx), self.sy(ly), 3
             c.create_oval(px - r, py - r, px + r, py + r, fill="#ffd23c", outline="black")
         lx, ly, _ = a.plate_lift_point(*a.pos)
@@ -893,12 +1412,14 @@ class AStarGui:
         faces = []
         for w in a.walls():
             faces += self.faces(w.box, "#5a5a5a" if w.name == "floor" else "#7a7a7a")
-        for o in a.obstacles:
+        for o in a.boxes():
             faces += self.faces(o.box, KIND_COLOR.get(o.kind, "#8a6a3a"))
-        hit_names = {n for pair in a.collisions() for n in pair}
+        hit_names = self.shown_hit_names()
         for sol in a.moving_solids():
-            faces += self.faces(sol.box,
-                                HIT_COLOR if sol.name in hit_names else KIND_COLOR[sol.kind])
+            faces += self.faces(sol.box, HIT_COLOR if sol.name in hit_names
+                                else KIND_COLOR.get(sol.kind, "#8a6a3a"))
+        if self.place_box is not None:
+            faces += self.faces(self.place_box, PLACE_COLOR if self.goal else HIT_COLOR)
 
         if self.explored:
             step = max(1, len(self.explored) // MAX_EXPLORED_DOTS)
@@ -915,6 +1436,15 @@ class AStarGui:
         for _, pts, color in sorted(faces, key=lambda f: -f[0]):
             v.create_polygon(pts, fill="", outline=color, width=1)
 
+        # the moveable area and lift limits: the box the tool point can
+        # reach, drawn at the plate underside's height like the path (lift
+        # z 0 to move_z, i.e. lift_floor_margin to that plus move_z)
+        corners = {(i, j, k): p(d.move_x * i, d.move_y * j, m + d.move_z * k)[:2]
+                   for i in (0, 1) for j in (0, 1) for k in (0, 1)}
+        for a_, b_ in ((a_, b_) for a_ in corners for b_ in corners
+                       if a_ < b_ and sum(x != y for x, y in zip(a_, b_)) == 1):
+            v.create_line(*corners[a_], *corners[b_], fill=LIMIT_COLOR, dash=(4, 3))
+
         if len(self.path) >= 2:
             pts = [n for q in self.path for n in p(q[0], q[1], q[2] + m)[:2]]
             v.create_line(pts, fill=PATH_COLOR, width=3, joinstyle="round")
@@ -929,8 +1459,8 @@ class AStarGui:
                               font=("TkDefaultFont", 8, "bold"))
 
         # lift points
-        for o in a.obstacles:
-            sx, sy, _ = p(*a.box_lift_point(o.box))
+        for o in a.boxes():
+            sx, sy, _ = p(*a.box_lift_point(o))
             r = 3
             v.create_oval(sx - r, sy - r, sx + r, sy + r, fill="#ffd23c", outline="black")
         sx, sy, _ = p(*a.plate_lift_point(*a.pos))
@@ -938,7 +1468,9 @@ class AStarGui:
         v.create_oval(sx - r, sy - r, sx + r, sy + r, fill="#ff5fb0", outline="black")
 
         v.create_text(8, VIEW_H - 8, anchor="sw", fill="#777777",
-                      text="drag: rotate   wheel: zoom   click: set Goal")
+                      text="drag: rotate   wheel: zoom   click: set Goal"
+                           + ("   (drag the carried box on the map to place it)"
+                              if a.carried else ""))
 
 
 if __name__ == "__main__":

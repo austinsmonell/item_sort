@@ -92,7 +92,10 @@ AxisConfig cfg[NUM_AXES] = {
   // a known distance and putting a rule on it.
   //   axes 1+2   11000 steps = 100.8 cm  ->  10913 steps/m
   //   axis 3     16000 steps = 148.5 cm  ->  10774 steps/m
-  //   axis 4     47000 steps =  28.0 cm  -> 167857 steps/m
+  //   axis 4     200000 steps/m: a commanded 15 cm moved 12.6 cm at the
+  //              old 167857 (from 47000 steps = 28.0 cm), and
+  //              167857 x 15 / 12.6 = 199830 - the 8 mm lead / 1600 ppr
+  //              screw value below
   // The limits are that measured travel, so a commanded move cannot be told
   // to leave the rail.
   //
@@ -110,7 +113,7 @@ AxisConfig cfg[NUM_AXES] = {
   // stop is to drive into it and keep pushing, which is a stalled motor at
   // full current for however long is left in maxHomeTravel. Nothing here
   // can detect arrival. Set a limit switch, or zero it by hand with Z 4.
-  {  2000,  8000,  600,  120,  -1,  1600,    0,   0,  400,  800,  64000,  0,   0,   167857, 0,    280,  0,   0 }
+  {  2000,  8000,  600,  120,  -1,  1600,    0,   0,  400,  800,  64000,  0,   0,   200000, 0,    280,  0,   0 }
 };
 
 // ---------------------------------------------------------------------

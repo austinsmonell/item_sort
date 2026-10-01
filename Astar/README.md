@@ -37,10 +37,19 @@ I checked this against `Arena.collisions()` at 20,000 random lattice points with
 Run `python astar_gui.py`. It loads the default arena and box layout from `arena_env.py`; to change either, edit that file.
 
 - **Start / Goal**: pick one, then click the map (x right, y up, origin bottom left of the moveable area). It is placed at the **Lift z** slider's value. The carriage and plate are drawn where you click, and turn red if they overlap a box.
-- **Run A\***: plans the tool point around all the boxes. It refuses to run if the start or goal is in collision, and after planning it checks every path point against the arena and reports whether the path is collision-free.
+- **Run A\***: plans the tool point around all the boxes. It refuses to run if the start or goal is in collision, and after planning it checks every path point against the arena and reports whether the path is collision-free. Planning gives up after 20 s (`PLAN_TIMEOUT_S` in `astar_core.py`) and says it timed out.
 - **Path** slider: steps the carriage and lift along the planned path, in both views.
 - **Diagonals**: 26-direction moves (on by default).
 - **Show explored (3D)**: shows the cells the search expanded, as faint dots. It is off by default because recording them uses extra memory.
+
+### Picking up and placing a box
+
+1. Set the box type's **pick sequence** (default `y-2, z3` for both types) and **lift height**, which is how far above the box's bottom its lift point is on its back face (default 8 cm for large, 6.5 cm for small). Then click the box, **Run A\***, then **Send path**. Pick and drop only take effect once a path has actually run: on the machine, or, when not connected, in the simulation that **Send path** plays instead (it moves Start to the path's end; **STOP** halts it).
+2. The box sits still through the pick sequence (the plate may overlap it). Only once the whole sequence has run is the box **on the lift**, held where it was at that moment. It moves with the tool point, and A* plans around the walls, floor and other boxes for it as well. A box with another box stacked on it is not picked up.
+3. **Click or drag on the map** (or click the floor in the 3D view) to choose where the carried box goes. A click centres the box on that point, and you can drag the box or its outline to adjust it. The dashed outline shows where it will land: on the nearest surface below it, meaning the top of the highest box under that footprint, or the floor (its top height is shown). The outline turns red if the box would overlap something or the carriage can't reach the spot. **Run A\*** plans a path to just above that spot, then lowers the box straight down as far as it will go, until its bottom meets the surface. If anything else stops the lowering first, the box isn't placed. The box then sits still while the pick sequence runs in reverse to drop it, and the status line says how many drop steps there are. The sequence reversed is the one that picked the box up. If that was empty, the drop uses the one currently set for the box type.
+4. **Place box here** cancels a box move: it plans setting the carried box down where it is now, lowered onto the surface under it, followed by the drop sequence, ready to **Send path**. If a path is running, press **STOP** first.
+5. **Boxes: Load on lift** puts a new box of the chosen type on the lift, where a finished pick would have left it with the lift at Start (the type's pick sequence undone from Start). Use it for a box that's already on the real lift, or to try placing without picking first. It's refused if a box is already on the lift or the new box would overlap something, so move the lift somewhere clear first. **Remove all boxes** empties the arena, including a box on the lift.
+6. While you are carrying a box, clicking another box is refused. When not connected, **Clear** puts the carried box back where it was picked from (a box loaded onto the lift is removed instead).
 
 On the map, boxes show their top height in cm (stacked boxes draw on top of those below). The right panel shows the whole arena in 3D: **drag to rotate, wheel to zoom**. The path is drawn at the plate's underside height.
 
@@ -50,7 +59,7 @@ The GUI's machine bar sends the planned path to the `esp32_4axis` controller ove
 
 1. Enter the board's hostname (`stepper.local`) or IP and **Connect**. All three axes must be homed and the drives on.
 2. **Start is always the machine's current position** (carriage x, y and lift z), updated live while connected; clicks on the map set the Goal only. Click a Goal and **Run A\***. If the machine moves after planning, run A* again, because the path must begin where the machine is.
-3. Set **Speed** and press **Send path to machine**. **STOP** sends `S`. The map follows the commanded position.
+3. Set **Speed** and press **Send path**. **STOP** sends `S`. The map follows the commanded position.
 
 The firmware runs each axis independently, so the path is streamed rather than sent as waypoints: every 50 ms the host sends a fresh absolute `M` target for each axis, sampled along the planned line at the chosen tool speed (capped at 70% of the slowest axis's `run` speed). `smooth_path()` first pulls the 0.25 cm lattice staircase into a few straight, collision-checked segments (a 646-point path became 13), because chasing the staircase makes the motors wiggle. Paths that leave a firmware soft limit are refused before anything moves.
 
@@ -98,6 +107,8 @@ python arena_env.py
 The window shows top, front (x-z) and side (y-z) views. Jog with the +/- buttons, the arrow keys (x/y), PgUp/PgDn or w/s (z), or type a position and press Go. `h` or Home puts the carriage at x = y = 0 with the lift raised. Motion is clamped to the travel limits, and any overlap between the moving parts and a wall or obstacle is drawn red and listed in the status line.
 
 **All wall, carriage and lift dimensions in `ArenaDims` are placeholders**, so edit them from the CAD. The carriage is a vertical box that fills the full arena height (`wall_height`) and moves in x and y only. The lift plate rides up and down its `+y` face (`plate_side`), with no rod, and its z is the lift's own reading, 0 at the low position and `move_z` at the high one. `lift_floor_margin` does not limit that travel: it places the arena floor, so with the lift reading 0 the plate is `lift_floor_margin` above the floor. The tool point is the carriage centre plus the plate's underside height. The wall clearance is worked out from how far the carriage and plate reach past that point, plus a separate gap for each wall (`wall_gap_x_min`, `wall_gap_x_max`, `wall_gap_y_min`, `wall_gap_y_max`).
+
+There is also an **overhead wall** across the whole x span of the arena. It is `wall_thickness` thick and runs from `overhead_wall_bottom` (31 cm) above the floor up to `wall_height`. Its +y face is at y = `overhead_wall_y` (-3 cm), in the lift's y coordinate, and it extends toward -y from there. Unlike the outer walls it is within the mechanism's reach. Near y = 0 the plate slides under it, so there the lift can only go up to 24.75, and A* plans around it. Home (x = y = 0) therefore raises the lift only as far as it will go without touching anything. The map draws the wall hatched.
 
 The standalone window starts with a default layout of floor-standing boxes: 3 large (32 x 20 x 15 cm) and 4 small (15.5 x 21 x 14 cm). Sizes are in `BOX_TYPES` and positions in `DEFAULT_LAYOUT` (`(type, x, y)` or `(type, x, y, z)` for a box stacked at height z; x, y is each box's corner nearest the origin), both in `arena_env.py`.
 

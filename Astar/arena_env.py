@@ -18,6 +18,10 @@ y = 0 is the bottom left of the top view.
     floor, so its height above the floor is z + lift_floor_margin. It does
     not limit the lift's travel.
   * The *tool point* is (carriage x, carriage y, plate z).
+  * A *carried box* is a box the lift has picked up (attach()): it leaves
+    the static obstacles and moves rigidly with the tool point until it is
+    put down again (release()). While carried it collides with the walls,
+    the floor and every other box, and planning allows for it.
   * The *outer walls* enclose the moveable area. The clearance on each side is
     worked out from how far the carriage and plate stick out of the reference
     point, plus that side's wall gap (`wall_gap_x_min`, `wall_gap_x_max`,
@@ -63,14 +67,20 @@ class ArenaDims:
     # clearance between the mechanism and the inside of each wall, measured
     # with the carriage at the edge of the moveable area. min = the wall at
     # x = 0 / y = 0 side, max = the wall at x = move_x / y = move_y side.
-    wall_gap_x_min: float = 3.0
+    wall_gap_x_min: float = 13.0
     wall_gap_x_max: float = 3.0
     wall_gap_y_min: float = 30.0
     wall_gap_y_max: float = 10.0
     floor_thickness: float = 2.0   # drawn below z = 0; z = 0 is the floor top
+    # overhead wall: hangs from the top of the arena across its whole x
+    # span, wall_thickness thick, from overhead_wall_bottom above the floor
+    # up to wall_height. Its +y face is at y = overhead_wall_y (the lift's
+    # y coordinate) and it extends wall_thickness toward -y from there.
+    overhead_wall_bottom: float = 31.0
+    overhead_wall_y: float = -3.0
 
     # ---- carriage (PLACEHOLDERS): vertical box on the floor -------------
-    carriage_w: float = 2.0       # size along x
+    carriage_w: float = 3.0       # size along x
     carriage_d: float = 2.5       # size along y
     # (its height is the wall height: it fills the whole arena height)
 
@@ -79,7 +89,7 @@ class ArenaDims:
     plate_len: float = 2.0         # how far it sticks out of that face
     plate_width: float = 7.5      # size across the face
     plate_t: float = 2.2           # thickness (vertical)
-    lift_floor_margin: float = 4.0  # plate underside above the floor at z = 0
+    lift_floor_margin: float = 3.0  # plate underside above the floor at z = 0
 
     def __post_init__(self):
         if self.plate_side not in ("+x", "-x", "+y", "-y"):
@@ -95,11 +105,13 @@ class ArenaDims:
 
 # Box types that sit on the floor. Sizes are (x, y, z) in cm.
 BOX_TYPES = {
-    "large": (32.0, 20.0, 15.0),
-    "small": (15.5, 21.0, 14.0),
+    "large": (33.0, 20.5, 16.0),
+    "small": (15.0, 21.0, 15.0),
 }
 
-BOX_LIFT_HEIGHT = 8.0  # a box's lift point is this far above its bottom
+BOX_LIFT_HEIGHT = 8.0  # a box's lift point is this far above its bottom, unless
+# its type has its own default here (the GUI can change them)
+BOX_LIFT_HEIGHTS = {"large": 8.0, "small": 6.5}
 
 # Default layout: (box type, x, y) or (box type, x, y, z), with (x, y) the
 # box's corner nearest the origin in the world frame and z the height of its
@@ -108,10 +120,13 @@ DEFAULT_LAYOUT = [
     ("large", 8.0, 8.0), ("large", 50.0, 8.0), ("large", 92.0, 8.0),
     ("small", 8.0, 45.0), ("small", 33.5, 45.0), ("small", 59.0, 45.0),
     ("small", 84.5, 45.0),
-    # stacked on top of the boxes above (z = height of the box below)
-    ("large", 8.0, 8.0, 15.0),        # large on large
-    ("small", 58.25, 7.5, 15.0),      # small centred on the second large
-    ("small", 84.5, 45.0, 14.0),      # small on small
+    # stacked on top of the boxes above (z = height of the box below, taken
+    # from BOX_TYPES so the stacks stay right if the sizes change)
+    ("large", 8.0, 8.0, BOX_TYPES["large"][2]),               # large on large
+    ("small", 50.0 + (BOX_TYPES["large"][0] - BOX_TYPES["small"][0]) / 2,
+     8.0 + (BOX_TYPES["large"][1] - BOX_TYPES["small"][1]) / 2,
+     BOX_TYPES["large"][2]),                                  # small centred on the second large
+    ("small", 84.5, 45.0, BOX_TYPES["small"][2]),             # small on small
 ]
 
 
@@ -152,6 +167,17 @@ class Arena:
             o if isinstance(o, Solid) else Solid(f"obstacle {i + 1}", tuple(o), "obstacle")
             for i, o in enumerate(obstacles)]
         self.pos = [0.0, 0.0, self.dims.move_z]  # x, y, z (lift starts up)
+        # per box type: how far above its bottom a box's lift point is
+        self.lift_heights = {kind: BOX_LIFT_HEIGHTS.get(kind, BOX_LIFT_HEIGHT)
+                             for kind in BOX_TYPES}
+        # the box on the lift, if any: (the Solid as it was picked up, its
+        # box relative to the tool point - x0 y0 z0 x1 y1 z1 minus x y z x y z)
+        self.carried: Optional[Tuple[Solid, Box]] = None
+        # (name, box): show that box - a static obstacle or the carried one -
+        # resting at `box` instead, as a static obstacle. Used to show a box
+        # sitting still through a pick or drop sequence, where it isn't
+        # on the lift. Always None while planning.
+        self.box_override: Optional[Tuple[str, Box]] = None
 
     # ---- limits and motion ---------------------------------------------
 
@@ -180,8 +206,14 @@ class Arena:
         return self.move_to(*target)
 
     def home(self):
-        """x = y = 0 with the lift fully raised."""
-        self.move_to(0.0, 0.0, self.dims.move_z)
+        """x = y = 0 with the lift raised as far as it will go without
+        touching anything (the overhead wall stops it short of move_z)."""
+        z = self.dims.move_z
+        while True:
+            self.move_to(0.0, 0.0, z)
+            if z <= 0 or not self.collisions():
+                return
+            z = max(0.0, z - 0.25)
 
     # ---- geometry ---------------------------------------------------------
 
@@ -201,11 +233,15 @@ class Arena:
             xa, xb = x - d.plate_width / 2, x + d.plate_width / 2
         return (xa, ya, z, xb, yb, z + d.plate_t)
 
-    def box_lift_point(self, box: Box) -> Tuple[float, float, float]:
+    def lift_height(self, kind: str) -> float:
+        """How far above its bottom a box of type `kind` is lifted from."""
+        return self.lift_heights.get(kind, BOX_LIFT_HEIGHT)
+
+    def box_lift_point(self, box: Solid) -> Tuple[float, float, float]:
         """Where a box is grabbed to lift it: centre of its back (+y) face,
-        `BOX_LIFT_HEIGHT` above its bottom."""
-        x0, y0, z0, x1, y1, z1 = box
-        return ((x0 + x1) / 2, y1, z0 + BOX_LIFT_HEIGHT)
+        its type's lift height (lift_height()) above its bottom."""
+        x0, y0, z0, x1, y1, z1 = box.box
+        return ((x0 + x1) / 2, y1, z0 + self.lift_height(box.kind))
 
     def plate_lift_point(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
         """The lift plate's own lift point: centre of its front top edge,
@@ -259,16 +295,87 @@ class Arena:
             Solid("wall +y", (ix0 - t, iy1, 0, ix1 + t, iy1 + t, h), "wall"),
             Solid("wall -x", (ix0 - t, iy0, 0, ix0, iy1, h), "wall"),
             Solid("wall +x", (ix1, iy0, 0, ix1 + t, iy1, h), "wall"),
+            self.overhead_wall(),
         ]
 
+    def overhead_wall(self) -> Solid:
+        """The wall hanging across the arena above the -y edge of the
+        moveable area. Unlike the outer walls it is inside the mechanism's
+        reach, so planning has to go around it (configuration_boxes())."""
+        d = self.dims
+        ix0, _, ix1, _ = self.inner_box()
+        t = d.wall_thickness
+        return Solid("wall overhead", (ix0 - t, d.overhead_wall_y - t, d.overhead_wall_bottom,
+                                       ix1 + t, d.overhead_wall_y, d.wall_height), "wall")
+
+    # ---- carrying a box ---------------------------------------------------
+
+    def carried_solid(self, x: float, y: float, z: float) -> Optional[Solid]:
+        """The carried box with the tool point at (x, y, z), or None."""
+        if self.carried is None:
+            return None
+        s, off = self.carried
+        t = (x, y, z)
+        return Solid(s.name, tuple(off[i] + t[i % 3] for i in range(6)), s.kind)
+
+    def carry(self, solid: Solid, tool_point: Tuple[float, float, float]):
+        """Put `solid`, a box that isn't one of the obstacles, straight onto
+        the lift where it is now, with the tool point at `tool_point`."""
+        self.carried = (solid, tuple(solid.box[k] - tool_point[k % 3] for k in range(6)))
+
+    def attach(self, name: str, tool_point: Tuple[float, float, float]) -> Solid:
+        """Pick up obstacle `name`, with the tool point at `tool_point`: it
+        stops being a static obstacle and from now on moves with the tool
+        point, keeping the position relative to it that it has right now."""
+        i = next(i for i, o in enumerate(self.obstacles) if o.name == name)
+        o = self.obstacles.pop(i)
+        self.carried = (o, tuple(o.box[k] - tool_point[k % 3] for k in range(6)))
+        return o
+
+    def release(self, box: Optional[Box] = None) -> Solid:
+        """Put the carried box down, at `box` (default: where it is at the
+        current pose), making it a static obstacle again. Returns it."""
+        s = self.carried[0]
+        placed = (self.carried_solid(*self.pos) if box is None
+                  else Solid(s.name, tuple(box), s.kind))
+        self.obstacles.append(placed)
+        self.carried = None
+        return placed
+
+    def support_height(self, x0: float, y0: float, x1: float, y1: float) -> float:
+        """Height a box with footprint (x0, y0)-(x1, y1) comes to rest at:
+        the top of the highest obstacle under it, or the floor."""
+        return max((o.box[5] for o in self.obstacles
+                    if o.box[0] < x1 and x0 < o.box[3] and o.box[1] < y1 and y0 < o.box[4]),
+                   default=0.0)
+
+    def overlapping(self, box: Box) -> List[str]:
+        """Names of the static solids that share volume with `box`."""
+        return [s.name for s in self.static_solids() if _overlap(box, s.box)]
+
+    def boxes(self) -> List[Solid]:
+        """The static boxes, with box_override applied."""
+        if self.box_override is None:
+            return list(self.obstacles)
+        name, box = self.box_override
+        out = [o._replace(box=box) if o.name == name else o for o in self.obstacles]
+        if self.carried is not None and self.carried[0].name == name:
+            out.append(self.carried[0]._replace(box=box))
+        return out
+
     def static_solids(self) -> List[Solid]:
-        return self.walls() + self.obstacles
+        return self.walls() + self.boxes()
 
     def moving_solids(self) -> List[Solid]:
-        """Carriage body and lift plate at the current pose."""
+        """Carried box (if any), carriage body and lift plate at the current
+        pose."""
         x, y, z = self.pos
-        return [Solid("carriage", self.carriage_box(x, y), "carriage"),
-                Solid("lift plate", self.plate_box(x, y, z), "plate")]
+        carried = self.carried_solid(x, y, z)
+        if carried and self.box_override and self.box_override[0] == carried.name:
+            carried = None              # resting where box_override says
+        return ([carried] if carried else []) + [
+            Solid("carriage", self.carriage_box(x, y), "carriage"),
+            Solid("lift plate", self.plate_box(x, y, z), "plate")]
 
     def collisions(self) -> List[Tuple[str, str]]:
         """Pairs (moving, static) of names that overlap at the current pose."""
@@ -291,8 +398,10 @@ class Arena:
             would overlap the obstacle vertically.
         `clearance` adds that much extra room around the obstacle. Touching
         is allowed (as in collisions()), so each box is shrunk by a hair.
-        The walls are not included: the moveable area already keeps the
-        mechanism inside them.
+        The outer walls are not included: the moveable area already keeps
+        the mechanism inside them. The overhead wall is, since the plate
+        can reach under it. A carried box is not kept inside by anything,
+        so for it every static solid counts, walls and floor included.
         """
         d = self.dims
         eps = 1e-6
@@ -300,7 +409,7 @@ class Arena:
         p = self.plate_box(0, 0, 0)  # plate at lift z = 0, in world z
         big = 1e6
         out: List[Box] = []
-        for o in self.obstacles:
+        for o in self.obstacles + [self.overhead_wall()]:
             b = o.box
             if b[2] < c[5] and b[5] > c[2]:  # overlaps the carriage's height
                 out.append((b[0] - c[3] - clearance + eps,
@@ -313,6 +422,12 @@ class Arena:
                         b[3] - p[0] + clearance - eps,
                         b[4] - p[1] + clearance - eps,
                         b[5] - p[2] + clearance - eps))
+        if self.carried is not None:
+            off = self.carried[1]
+            for s in self.static_solids():
+                b = s.box
+                out.append(tuple(b[i] - off[i + 3] - clearance + eps for i in range(3))
+                           + tuple(b[i + 3] - off[i] + clearance - eps for i in range(3)))
         return out
 
     def overall_size(self) -> Tuple[float, float, float]:
@@ -400,7 +515,7 @@ class View:
                  outline="#2a2a2a")
         for sol in arena.moving_solids():
             bad = sol.name in hit_names
-            rect(sol.box, fill=HIT_COLOR if bad else KIND_COLOR[sol.kind],
+            rect(sol.box, fill=HIT_COLOR if bad else KIND_COLOR.get(sol.kind, "#8a6a3a"),
                  outline="white", stipple="gray50" if sol.kind == "carriage" else "")
 
         # lift points
@@ -409,7 +524,7 @@ class View:
             c.create_oval(px - r, py - r, px + r, py + r, fill=color, outline="black")
 
         for o in arena.obstacles:
-            point(arena.box_lift_point(o.box), "#ffd23c")
+            point(arena.box_lift_point(o), "#ffd23c")
         point(arena.plate_lift_point(*arena.pos), "#ff5fb0")
 
         c.create_text(6, 4, anchor="nw", fill="#bbbbbb", text=self.title)
