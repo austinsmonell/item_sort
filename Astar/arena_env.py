@@ -106,12 +106,15 @@ class ArenaDims:
 # Box types that sit on the floor. Sizes are (x, y, z) in cm.
 BOX_TYPES = {
     "large": (33.0, 20.5, 16.0),
-    "small": (15.0, 21.0, 15.0),
+    "small": (15.0, 21.0, 16.0),
 }
 
 BOX_LIFT_HEIGHT = 8.0  # a box's lift point is this far above its bottom, unless
 # its type has its own default here (the GUI can change them)
 BOX_LIFT_HEIGHTS = {"large": 8.0, "small": 6.5}
+# per box type: the lift point's offset in y from the box's back face (+y is
+# away from the box, -y into it); 0 unless listed (the GUI can change them)
+BOX_LIFT_Y_OFFSETS = {"large": 1.0, "small": 1.0}
 
 # Default layout: (box type, x, y) or (box type, x, y, z), with (x, y) the
 # box's corner nearest the origin in the world frame and z the height of its
@@ -170,6 +173,7 @@ class Arena:
         # per box type: how far above its bottom a box's lift point is
         self.lift_heights = {kind: BOX_LIFT_HEIGHTS.get(kind, BOX_LIFT_HEIGHT)
                              for kind in BOX_TYPES}
+        self.lift_y_offsets = {kind: BOX_LIFT_Y_OFFSETS.get(kind, 0.0) for kind in BOX_TYPES}
         # the box on the lift, if any: (the Solid as it was picked up, its
         # box relative to the tool point - x0 y0 z0 x1 y1 z1 minus x y z x y z)
         self.carried: Optional[Tuple[Solid, Box]] = None
@@ -237,11 +241,18 @@ class Arena:
         """How far above its bottom a box of type `kind` is lifted from."""
         return self.lift_heights.get(kind, BOX_LIFT_HEIGHT)
 
+    def lift_y_offset(self, kind: str) -> float:
+        """How far in y from its back face a box of type `kind` is lifted
+        from (+y away from the box)."""
+        return self.lift_y_offsets.get(kind, 0.0)
+
     def box_lift_point(self, box: Solid) -> Tuple[float, float, float]:
-        """Where a box is grabbed to lift it: centre of its back (+y) face,
-        its type's lift height (lift_height()) above its bottom."""
+        """Where a box is grabbed to lift it: centred on its back (+y) face
+        in x, its type's lift y offset (lift_y_offset()) from that face in
+        y, and its type's lift height (lift_height()) above its bottom."""
         x0, y0, z0, x1, y1, z1 = box.box
-        return ((x0 + x1) / 2, y1, z0 + self.lift_height(box.kind))
+        return ((x0 + x1) / 2, y1 + self.lift_y_offset(box.kind),
+                z0 + self.lift_height(box.kind))
 
     def plate_lift_point(self, x: float, y: float, z: float) -> Tuple[float, float, float]:
         """The lift plate's own lift point: centre of its front top edge,

@@ -55,6 +55,7 @@ PATH_COLOR = "#46b478"
 LIMIT_COLOR = "#4a7db5"       # the moveable area / lift limits (dashed)
 PLACE_COLOR = "#9fd0ff"       # where a carried box is to be placed
 DEFAULT_PICK_SEQUENCE = "y-2, z4"  # starting pick sequence for every box type
+HOME_POSE = (20.0, 0.0, 10.0)     # tool point (x, y, lift z) cm the Home button goes to
 
 
 def snap(v, lo, hi):
@@ -164,6 +165,10 @@ class AStarGui:
         self.clearance = tk.DoubleVar(value=0.5)
         tk.Spinbox(toolbar, from_=0, to=5, increment=0.25, width=5,
                    textvariable=self.clearance).pack(side="left", padx=2)
+        tk.Label(toolbar, text="Timeout (s):").pack(side="left", padx=(12, 0))
+        self.timeout = tk.DoubleVar(value=PLAN_TIMEOUT_S)
+        tk.Spinbox(toolbar, from_=1, to=600, increment=5, width=5,
+                   textvariable=self.timeout).pack(side="left", padx=2)
         tk.Button(toolbar, text="Run A*", command=self.run).pack(side="left", padx=(12, 2))
         tk.Button(toolbar, text="Clear", command=self.clear).pack(side="left", padx=2)
         tk.Button(toolbar, text="Place box here", command=self.place_here
@@ -187,9 +192,14 @@ class AStarGui:
         tk.Label(seqframe, text="Box type").grid(row=0, column=0, padx=(4, 4))
         tk.Label(seqframe, text="Pick sequence").grid(row=0, column=1, padx=4)
         tk.Label(seqframe, text="Lift height (cm above box bottom)").grid(row=0, column=2, padx=4)
-        # per box type, how far above its bottom the plate lifts it from
+        tk.Label(seqframe, text="Lift y offset (cm, + away from box)").grid(
+            row=0, column=3, padx=4)
+        # per box type, where the plate lifts it from: how far above its
+        # bottom, and how far in y from its back face
         self.lift_height = {kind: tk.StringVar(value=f"{self.arena.lift_height(kind):g}")
                             for kind in BOX_TYPES}
+        self.lift_y_offset = {kind: tk.StringVar(value=f"{self.arena.lift_y_offset(kind):g}")
+                              for kind in BOX_TYPES}
         for r, kind in enumerate(BOX_TYPES, start=1):
             tk.Label(seqframe, text=kind).grid(row=r, column=0, sticky="w", padx=(4, 4))
             tk.Entry(seqframe, textvariable=self.pick_seq[kind], width=20
@@ -198,7 +208,12 @@ class AStarGui:
                        textvariable=self.lift_height[kind]
                        ).grid(row=r, column=2, padx=4, pady=1, sticky="w")
             self.lift_height[kind].trace_add(
-                "write", lambda *_, k=kind: self.on_lift_height(k))
+                "write", lambda *_, k=kind: self.on_lift_point(k))
+            tk.Spinbox(seqframe, from_=-20, to=20, increment=0.25, width=6,
+                       textvariable=self.lift_y_offset[kind]
+                       ).grid(row=r, column=3, padx=4, pady=1, sticky="w")
+            self.lift_y_offset[kind].trace_add(
+                "write", lambda *_, k=kind: self.on_lift_point(k))
 
         boxbar = tk.Frame(root)
         boxbar.pack(fill="x", padx=8, pady=(0, 6))
@@ -245,6 +260,10 @@ class AStarGui:
         self.send_btn.pack(side="left", padx=(12, 2))
         tk.Button(mbar, text="STOP", fg="white", bg="#c03030",
                   command=self.stop_machine).pack(side="left", padx=2)
+        tk.Button(mbar, text="Home", command=self.go_home).pack(side="left", padx=(12, 2))
+        tk.Label(mbar, text="at x, y, z:").pack(side="left")
+        self.home_pose = tk.StringVar(value=", ".join(f"{v:g}" for v in HOME_POSE))
+        tk.Entry(mbar, textvariable=self.home_pose, width=12).pack(side="left", padx=2)
 
         views = tk.Frame(root)
         views.pack(padx=8)
@@ -362,6 +381,10 @@ class AStarGui:
         # captured now: clicking the map while it runs clears these
         path, speed, rule = list(self.path), self.speed.get(), self.path_rule
         arrived = (self.on_arrival, self.path[-1])
+        # the machine runs through every corner without stopping, except
+        # where the plate is engaged with a box (a pick/drop sequence, or
+        # backing out of one): those moves stay exact, so it rests at each
+        engaged = {i for i, ig in enumerate(self.path_ignore) if ig is not None}
         self.running = True
         self.send_btn.config(state="disabled")
         if not self.link.connected:
@@ -374,10 +397,12 @@ class AStarGui:
 
         def work():
             try:
-                for part, k in ((path[:r + 1], None), (path[r:], r)):
-                    if len(part) >= 2:
-                        self.link.follow(part, speed, progress=lambda p, k=k:
-                                         self.events.put(("pose", (p, rule, k))))
+                for lo, hi, k in ((0, r, None), (r, len(path) - 1, r)):
+                    if hi > lo:
+                        self.link.follow(path[lo:hi + 1], speed,
+                                         progress=lambda p, k=k:
+                                         self.events.put(("pose", (p, rule, k))),
+                                         stops=[i - lo for i in engaged if lo < i < hi])
                 self.events.put(("done", ("Arrived at the goal.", arrived)))
             except LinkError as e:
                 self.events.put(("done", (f"Path not completed: {e}", None)))
@@ -387,6 +412,31 @@ class AStarGui:
                                           "controller messages below.", None)))
                 self.link.stop()
         threading.Thread(target=work, daemon=True).start()
+
+    def go_home(self):
+        """Plan A* from where the mechanism is to the Home position and send
+        the path straight away (simulated when not connected). A box on the
+        lift goes along with it."""
+        if self.running:
+            self.status.set("A path is running - wait for it or press STOP first.")
+            return
+        d = self.arena.dims
+        try:
+            vals = [float(v) for v in self.home_pose.get().replace(",", " ").split()]
+            if len(vals) != 3:
+                raise ValueError
+        except ValueError:
+            self.status.set("Home position: enter x, y, z in cm, e.g. 20, 0, 10.")
+            return
+        home = tuple(snap(v, 0.0, hi) for v, hi in zip(vals, (d.move_x, d.move_y, d.move_z)))
+        self.sync_start()
+        if all(abs(a - b) < 1e-9 for a, b in zip(self.start, home)):
+            self.status.set("Already at Home.")
+            return
+        self.set_goal(home)
+        self.run()
+        if self.path:
+            self.send_path()
 
     def simulate(self, path, speed, rule, arrived):
         """Not connected: play the path back on screen at `speed`, then treat
@@ -536,13 +586,16 @@ class AStarGui:
         just inside that grown region and is unreachable. Backing off keeps
         the goal just outside it, so a path can actually reach it; run()
         then closes that last bit itself, once the fine path is smoothed,
-        with append_final_contact().
+        with append_final_contact(). A lift point set inside the box (a
+        negative lift y offset) is backed off by that much more, so the
+        goal is still outside the box.
         """
         try:
             clearance = max(0.0, self.clearance.get())
         except tk.TclError:
             clearance = 0.5
-        return self.box_offset_point(box, clearance + RESOLUTION_CM)
+        inside = max(0.0, -self.arena.lift_y_offset(box.kind))
+        return self.box_offset_point(box, clearance + RESOLUTION_CM + inside)
 
     def sequence_for(self, kind):
         """The parsed pick sequence configured for box type `kind`, or []
@@ -649,17 +702,21 @@ class AStarGui:
                  min(max(place[2], box[2] - off[2] + clearance + RESOLUTION_CM), d.move_z))
         self.set_goal(above, place=place)
 
-    def on_lift_height(self, kind):
-        """A lift height was edited: use it for every box of that type from
-        now on. A Goal aimed at a box is aimed afresh, since its lift point
-        moved; a half-typed value that isn't a number is ignored."""
+    def on_lift_point(self, kind):
+        """A lift height or lift y offset was edited: use it for every box of
+        that type from now on. A Goal aimed at a box is aimed afresh, since
+        its lift point moved; a half-typed value that isn't a number is
+        ignored."""
         try:
             h = float(self.lift_height[kind].get())
+            dy = float(self.lift_y_offset[kind].get())
         except (ValueError, tk.TclError):
             return
-        if h < 0 or h == self.arena.lift_height(kind):
+        if h < 0 or (h == self.arena.lift_height(kind)
+                     and dy == self.arena.lift_y_offset(kind)):
             return
         self.arena.lift_heights[kind] = h
+        self.arena.lift_y_offsets[kind] = dy
         if self.target_box is not None and self.target_box.kind == kind and not self.running:
             self.set_goal(self.box_goal_point(self.target_box), self.target_box)
         else:
@@ -687,7 +744,8 @@ class AStarGui:
         w, dp, h = BOX_TYPES[kind]
         # on the lattice, like every box a real pick lifts (which is why the
         # plate's own lift point may sit a hair off the box's)
-        x0, y1, z0 = (snap(v, -1e6, 1e6) for v in (lx - w / 2, ly, lz - self.arena.lift_height(kind)))
+        x0, y1, z0 = (snap(v, -1e6, 1e6) for v in (lx - w / 2, ly - self.arena.lift_y_offset(kind),
+                                                   lz - self.arena.lift_height(kind)))
         taken = {o.name for o in self.arena.obstacles}
         n = 1
         while f"{kind} box {n}" in taken:
@@ -822,15 +880,19 @@ class AStarGui:
             clearance = max(0.0, self.clearance.get())
         except tk.TclError:
             clearance = 0.5
+        try:
+            timeout = max(0.1, self.timeout.get())
+        except tk.TclError:
+            timeout = PLAN_TIMEOUT_S
         plan_start, prepend_pts, prepend_ignore = self.plan_start_and_prepend(clearance)
         try:
             self.path = plan_path(
                 self.arena, plan_start, self.goal, diagonals=self.diagonals.get(),
                 explored=self.explored if self.show_explored.get() else None,
-                clearance=clearance, timeout=PLAN_TIMEOUT_S)
+                clearance=clearance, timeout=timeout)
         except PlanningTimeout:
             self.path = []
-            self.status.set(f"Planning timed out after {PLAN_TIMEOUT_S:g} s without "
+            self.status.set(f"Planning timed out after {timeout:g} s without "
                             "finding a path - try a different Goal, or lower the "
                             "Clearance.")
             self.draw()
@@ -1109,7 +1171,7 @@ class AStarGui:
             pts.append(nxt)
             ignore.append(name)
             p = nxt
-        standoff = self.box_offset_point(box, clearance + RESOLUTION_CM)
+        standoff = self.box_goal_point(box)
         if not self.straight_clear(p, standoff):
             return None
         return standoff, pts, ignore
